@@ -1,0 +1,32 @@
+{
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index.js"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "*"
+        }
+      ]
+    }
+  ],
+  "regions": [
+    "bom1"
+  ],
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 20,
+      "includeFiles": "data.json.gz"
+    }
+  }
+}

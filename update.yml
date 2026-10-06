@@ -1,0 +1,58 @@
+name: Update catalog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */3 * * *"   # protit 3 ghontay
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-catalog
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Site check (ctgmovies.com GitHub theke khule kina)
+        id: check
+        run: |
+          echo "Runner country: $(curl -s -m 15 https://ipinfo.io/country || echo unknown)"
+          code=$(curl -sS -m 25 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36" \
+            -o page.html -w "%{http_code}" "https://ctgmovies.com/movies?page=1" || echo 000)
+          n=$(grep -o 'href="/movies/' page.html 2>/dev/null | wc -l)
+          echo "RESULT: HTTP $code | movie links found: $n"
+          if [ "$code" = "200" ] && [ "$n" -gt 0 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "SITE KHULCHE - auto-update chalbe"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::GitHub theke ctgmovies.com khole na (HTTP $code). Auto-update kaj korbe na."
+          fi
+
+      - name: Notun movie khuje data update
+        if: steps.check.outputs.ok == 'true'
+        run: node scraper.js update
+
+      - name: Save (Vercel nijei deploy korbe)
+        if: steps.check.outputs.ok == 'true'
+        run: |
+          if git diff --quiet -- data.json.gz; then
+            echo "Notun kichu nai."
+          else
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git checkout --orphan clean
+            git add -A
+            git commit -m "Update catalog $(date -u +%F-%H%M)"
+            git push -f origin clean:${{ github.ref_name }}
+          fi
