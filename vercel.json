@@ -22,11 +22,5 @@
   ],
   "regions": [
     "bom1"
-  ],
-  "functions": {
-    "api/index.js": {
-      "maxDuration": 20,
-      "includeFiles": "data.json.gz"
-    }
-  }
+  ]
 }
