@@ -1,206 +1,288 @@
 
-name: Import Catalog to Cloudflare D1
+const API = "https://ctgmovies-api-new.proshantobarua041.workers.dev";
+const PAGE = 100;
 
-on:
-  workflow_dispatch:
+const manifest = {
+  id: "com.mhthe1.ctgmovies.bridge",
+  version: "3.1.0",
+  name: "CTGMovies Bridge",
+  description: "CTGMovies catalog and streams through Cloudflare D1",
+  logo: "https://dhakastremio.mehedihtanvir.me/icon.svg",
+  resources: [
+    "catalog",
+    { name: "meta", types: ["movie", "series"], idPrefixes: ["ctg:"] },
+    { name: "stream", types: ["movie", "series"], idPrefixes: ["ctg:"] }
+  ],
+  types: ["movie", "series"],
+  catalogs: [
+    {
+      type: "movie",
+      id: "ctg_movies",
+      name: "CTGMovies Movies",
+      extra: [
+        { name: "search", isRequired: false },
+        { name: "skip", isRequired: false }
+      ]
+    },
+    {
+      type: "series",
+      id: "ctg_tv",
+      name: "CTGMovies TV Shows",
+      extra: [
+        { name: "search", isRequired: false },
+        { name: "skip", isRequired: false }
+      ]
+    },
+    {
+      type: "series",
+      id: "ctg_anime",
+      name: "CTGMovies Anime",
+      extra: [
+        { name: "search", isRequired: false },
+        { name: "skip", isRequired: false }
+      ]
+    }
+  ],
+  behaviorHints: {
+    configurable: false,
+    configurationRequired: false
+  }
+};
 
-permissions:
-  contents: read
+const CAT_KIND = {
+  ctg_movies: "movies",
+  ctg_tv: "tv",
+  ctg_anime: "anime"
+};
 
-concurrency:
-  group: ctg-d1-import
-  cancel-in-progress: false
+let cache = null;
+let cacheTime = 0;
 
-jobs:
-  import:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+async function getItems() {
+  if (cache && Date.now() - cacheTime < 60000) {
+    return cache;
+  }
 
-    steps:
-      - uses: actions/checkout@v4
+  const all = [];
+  const seen = new Set();
+  const pageSize = 50;
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+  for (let skip = 0; skip < 100000; skip += pageSize) {
+    const url = `${API}/movies?skip=${skip}&limit=${pageSize}`;
+    const response = await fetch(url, {
+      headers: { Accept: "application/json" }
+    });
 
-      - name: Import catalog
-        env:
-          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          D1_ID: ${{ secrets.D1_DATABASE_ID }}
-        run: |
-          cat > import.js <<'JS'
-          const fs = require("fs");
-          const zlib = require("zlib");
+    if (!response.ok) {
+      throw new Error(`Cloudflare API HTTP ${response.status}`);
+    }
 
-          const BATCH = 10;
-          const PARALLEL = 3;
+    const data = await response.json();
+    const items = Array.isArray(data.items) ? data.items : [];
 
-          async function main() {
-            const { CF_TOKEN, CF_ACCOUNT, D1_ID } = process.env;
+    for (const item of items) {
+      if (item.id && !seen.has(item.id)) {
+        seen.add(item.id);
+        all.push(item);
+      }
+    }
 
-            if (!CF_TOKEN || !CF_ACCOUNT || !D1_ID) {
-              throw new Error("Missing Cloudflare GitHub secrets");
-            }
+    if (items.length < pageSize) break;
+  }
 
-            if (!fs.existsSync("data.json.gz")) {
-              throw new Error("data.json.gz not found at repository root");
-            }
+  cache = all;
+  cacheTime = Date.now();
+  return cache;
+}
 
-            console.log("Decompressing catalog...");
-            const raw = zlib.gunzipSync(
-              fs.readFileSync("data.json.gz")
-            ).toString("utf8");
+function typeOf(kind) {
+  return kind === "movies" ? "movie" : "series";
+}
 
-            const json = JSON.parse(raw);
-            const items = Array.isArray(json) ? json : json.items;
+function card(item) {
+  return {
+    id: item.id,
+    type: typeOf(item.kind),
+    name: item.name,
+    poster: item.poster || undefined,
+    releaseInfo: item.year != null ? String(item.year) : undefined
+  };
+}
 
-            if (!Array.isArray(items) || !items.length) {
-              throw new Error("Catalog is empty or invalid");
-            }
+function parseExtra(str) {
+  const out = {};
+  if (!str) return out;
 
-            const endpoint =
-              `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/d1/database/${D1_ID}/query`;
+  for (const part of str.split("&")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
 
-            async function query(sql, params = []) {
-              for (let attempt = 0; attempt < 5; attempt++) {
-                try {
-                  const r = await fetch(endpoint, {
-                    method: "POST",
-                    headers: {
-                      Authorization: `Bearer ${CF_TOKEN}`,
-                      "Content-Type": "application/json"
-                    },
-                    body: JSON.stringify({ sql, params })
-                  });
+    const key = part.slice(0, i);
+    const value = part.slice(i + 1);
 
-                  const result = await r.json();
+    try {
+      out[key] = decodeURIComponent(value);
+    } catch {
+      out[key] = value;
+    }
+  }
 
-                  if (r.ok && result.success) return result;
+  return out;
+}
 
-                  const msg = JSON.stringify(result.errors || result);
-                  if (r.status < 500 && r.status !== 429) {
-                    throw new Error(msg);
-                  }
-                  console.log(`Retry ${attempt + 1}: ${msg}`);
-                } catch (e) {
-                  if (attempt === 4) throw e;
-                  console.log(`Retry ${attempt + 1}: ${e.message}`);
-                }
+async function catalog(id, extra) {
+  const kind = CAT_KIND[id];
+  if (!kind) return { metas: [] };
 
-                await new Promise(resolve =>
-                  setTimeout(resolve, 500 * (attempt + 1))
-                );
-              }
-            }
+  let items = (await getItems()).filter(item => item.kind === kind);
 
-            await query(`
-              CREATE TABLE IF NOT EXISTS catalog (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                name TEXT,
-                data TEXT NOT NULL
-              )
-            `);
+  if (extra.search) {
+    const q = extra.search.toLowerCase();
+    items = items.filter(item =>
+      String(item.name || "").toLowerCase().includes(q)
+    );
+  }
 
-            await query(
-              "CREATE INDEX IF NOT EXISTS idx_catalog_kind ON catalog(kind)"
-            );
-            await query(
-              "CREATE INDEX IF NOT EXISTS idx_catalog_name ON catalog(name)"
-            );
+  const skip = Math.max(0, parseInt(extra.skip || "0", 10) || 0);
 
-            const batches = [];
-            for (let i = 0; i < items.length; i += BATCH) {
-              batches.push(items.slice(i, i + BATCH));
-            }
+  return {
+    metas: items.slice(skip, skip + PAGE).map(card)
+  };
+}
 
-            let next = 0;
-            let completed = 0;
-            let failed = 0;
+async function meta(id) {
+  const items = await getItems();
+  const item = items.find(x => x.id === id);
 
-            async function worker() {
-              while (true) {
-                const index = next++;
-                if (index >= batches.length) return;
+  if (!item) return { meta: null };
 
-                const batch = batches[index];
+  const result = {
+    id: item.id,
+    type: typeOf(item.kind),
+    name: item.name,
+    poster: item.poster || undefined,
+    background: item.backdrop || undefined,
+    description: item.overview || undefined,
+    releaseInfo: item.year != null ? String(item.year) : undefined,
+    imdbRating: item.rating != null ? String(item.rating) : undefined
+  };
 
-                try {
-                  const params = [];
-                  const values = batch.map((item, offset) => {
-                    const id = String(
-                      item.id || item.slug || item.name || ""
-                    ).trim();
+  if (item.kind !== "movies") {
+    result.videos = (item.episodes || []).map(ep => ({
+      id: `${item.id}:${ep.s}:${ep.e}`,
+      title: ep.name || `Episode ${ep.e}`,
+      season: ep.s,
+      episode: ep.e,
+      overview: ep.overview,
+      thumbnail: ep.still,
+      released: ep.air
+        ? new Date(ep.air).toISOString()
+        : new Date(0).toISOString()
+    }));
+  }
 
-                    if (!id) {
-                      throw new Error(
-                        `Missing ID in batch ${index + 1}, item ${offset + 1}`
-                      );
-                    }
+  return { meta: result };
+}
 
-                    const metadata = { ...item };
-                    delete metadata.links;
+function makeStreams(links) {
+  return (links || [])
+    .filter(link => link && typeof link.url === "string" && link.url)
+    .map(link => ({
+      name: `CTGMovies\n${link.quality || "Direct"}`,
+      title: `${link.quality || "Direct"} (${link.source || "Server"})`,
+      url: link.url,
+      behaviorHints: {
+        notWebReady: true,
+        proxyHeaders: {
+          request: { Referer: "https://ctgmovies.com/" }
+        }
+      }
+    }));
+}
 
-                    if (Array.isArray(metadata.episodes)) {
-                      metadata.episodes = metadata.episodes.map(ep => {
-                        const clean = { ...ep };
-                        delete clean.links;
-                        delete clean.url;
-                        delete clean.streamUrl;
-                        return clean;
-                      });
-                    }
+async function stream(id) {
+  const items = await getItems();
 
-                    params.push(
-                      id,
-                      String(item.kind || "movie"),
-                      String(item.name || ""),
-                      JSON.stringify(metadata)
-                    );
+  // Movie ID
+  const movie = items.find(item => item.id === id);
+  if (movie && movie.kind === "movies") {
+    return { streams: makeStreams(movie.links) };
+  }
 
-                    return "(?, ?, ?, ?)";
-                  });
+  // Series episode ID: ctg:tv:slug:season:episode
+  // Match the full ID generated by meta().
+  for (const item of items) {
+    if (item.kind === "movies") continue;
 
-                  await query(`
-                    INSERT INTO catalog (id, kind, name, data)
-                    VALUES ${values.join(",")}
-                    ON CONFLICT(id) DO UPDATE SET
-                      kind = excluded.kind,
-                      name = excluded.name,
-                      data = excluded.data
-                  `, params);
+    const episode = (item.episodes || []).find(
+      ep => `${item.id}:${ep.s}:${ep.e}` === id
+    );
 
-                  completed += batch.length;
-                  if (completed % 100 === 0 || completed === items.length) {
-                    console.log(`Progress: ${completed}/${items.length}`);
-                  }
-                } catch (e) {
-                  failed += batch.length;
-                  console.error(`Batch ${index + 1} failed: ${e.message}`);
-                  throw e;
-                }
-              }
-            }
+    if (episode) {
+      return { streams: makeStreams(episode.links) };
+    }
+  }
 
-            await Promise.all(
-              Array.from({ length: PARALLEL }, () => worker())
-            );
+  return { streams: [] };
+}
 
-            console.log(
-              `Import complete. Items processed: ${completed}; failed: ${failed}`
-            );
+module.exports = async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
 
-            const check = await query(
-              "SELECT COUNT(*) AS total FROM catalog"
-            );
-            console.log("D1 catalog count:", JSON.stringify(check.result));
-          }
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
 
-          main().catch(error => {
-            console.error("IMPORT FAILED:", error.message);
-            process.exit(1);
-          });
-          JS
+  const parts = decodeURIComponent((req.url || "/").split("?")[0])
+    .replace(/\.json$/, "")
+    .split("/")
+    .filter(Boolean);
 
-          node import.js
+  const resource = parts[0];
+  const type = parts[1];
+  const id = parts[2];
+  const extra = parseExtra(parts[3]);
+
+  try {
+    if (!resource || resource === "manifest") {
+      return res.status(200).json(manifest);
+    }
+
+    if (resource === "status") {
+      const items = await getItems();
+
+      return res.status(200).json({
+        source: "Cloudflare D1",
+        api: API,
+        items: items.length,
+        movies: items.filter(x => x.kind === "movies").length,
+        tv: items.filter(x => x.kind === "tv").length,
+        anime: items.filter(x => x.kind === "anime").length
+      });
+    }
+
+    if (resource === "catalog") {
+      return res.status(200).json(await catalog(id, extra));
+    }
+
+    if (resource === "meta") {
+      return res.status(200).json(await meta(id));
+    }
+
+    if (resource === "stream") {
+      return res.status(200).json(await stream(id, type));
+    }
+
+    return res.status(404).json({ error: "not found" });
+  } catch (error) {
+    console.error(error);
+
+    return res.status(500).json({
+      error: error.message,
+      streams: resource === "stream" ? [] : undefined
+    });
+  }
+};
