@@ -7,77 +7,91 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ctg-d1-import
+  cancel-in-progress: false
+
 jobs:
   import:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Import catalog
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_ID: ${{ secrets.D1_DATABASE_ID }}
         run: |
-          cat > import-catalog.js <<'JS'
+          cat > import.js <<'JS'
           const fs = require("fs");
           const zlib = require("zlib");
 
+          const BATCH = 10;
+          const PARALLEL = 3;
+
           async function main() {
-            for (const key of [
-              "CLOUDFLARE_API_TOKEN",
-              "CLOUDFLARE_ACCOUNT_ID",
-              "D1_DATABASE_ID"
-            ]) {
-              if (!process.env[key]) throw new Error(`Missing secret: ${key}`);
+            const { CF_TOKEN, CF_ACCOUNT, D1_ID } = process.env;
+
+            if (!CF_TOKEN || !CF_ACCOUNT || !D1_ID) {
+              throw new Error("Missing Cloudflare GitHub secrets");
             }
 
             if (!fs.existsSync("data.json.gz")) {
-              throw new Error("data.json.gz not found in repository root");
+              throw new Error("data.json.gz not found at repository root");
             }
 
+            console.log("Decompressing catalog...");
             const raw = zlib.gunzipSync(
               fs.readFileSync("data.json.gz")
             ).toString("utf8");
 
-            const parsed = JSON.parse(raw);
-            const items = Array.isArray(parsed) ? parsed : parsed.items;
+            const json = JSON.parse(raw);
+            const items = Array.isArray(json) ? json : json.items;
 
-            if (!Array.isArray(items) || items.length === 0) {
-              throw new Error("Catalog is empty or JSON format is invalid");
+            if (!Array.isArray(items) || !items.length) {
+              throw new Error("Catalog is empty or invalid");
             }
 
-            const token = process.env.CLOUDFLARE_API_TOKEN;
-            const account = process.env.CLOUDFLARE_ACCOUNT_ID;
-            const database = process.env.D1_DATABASE_ID;
             const endpoint =
-              `https://api.cloudflare.com/client/v4/accounts/${account}/d1/database/${database}/query`;
+              `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/d1/database/${D1_ID}/query`;
 
             async function query(sql, params = []) {
-              const response = await fetch(endpoint, {
-                method: "POST",
-                headers: {
-                  "Authorization": `Bearer ${token}`,
-                  "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ sql, params })
-              });
+              for (let attempt = 0; attempt < 5; attempt++) {
+                try {
+                  const r = await fetch(endpoint, {
+                    method: "POST",
+                    headers: {
+                      Authorization: `Bearer ${CF_TOKEN}`,
+                      "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ sql, params })
+                  });
 
-              const result = await response.json();
+                  const result = await r.json();
 
-              if (!response.ok || !result.success) {
-                throw new Error(JSON.stringify(result.errors || result));
+                  if (r.ok && result.success) return result;
+
+                  const msg = JSON.stringify(result.errors || result);
+                  if (r.status < 500 && r.status !== 429) {
+                    throw new Error(msg);
+                  }
+                  console.log(`Retry ${attempt + 1}: ${msg}`);
+                } catch (e) {
+                  if (attempt === 4) throw e;
+                  console.log(`Retry ${attempt + 1}: ${e.message}`);
+                }
+
+                await new Promise(resolve =>
+                  setTimeout(resolve, 500 * (attempt + 1))
+                );
               }
-
-              return result;
             }
 
             await query(`
@@ -92,70 +106,101 @@ jobs:
             await query(
               "CREATE INDEX IF NOT EXISTS idx_catalog_kind ON catalog(kind)"
             );
-
             await query(
               "CREATE INDEX IF NOT EXISTS idx_catalog_name ON catalog(name)"
             );
 
-            const batchSize = 50;
-            let imported = 0;
-
-            for (let start = 0; start < items.length; start += batchSize) {
-              const batch = items.slice(start, start + batchSize);
-              const params = [];
-              const placeholders = batch.map(item => {
-                const id = String(item.id || item.slug || item.name || "").trim();
-                if (!id) throw new Error("An item has no usable ID");
-
-                const kind = String(item.kind || "movie");
-                const name = String(item.name || "");
-
-                // Store catalog metadata, not direct playback URLs.
-                const metadata = { ...item };
-                delete metadata.links;
-
-                if (Array.isArray(metadata.episodes)) {
-                  metadata.episodes = metadata.episodes.map(ep => {
-                    const clean = { ...ep };
-                    delete clean.links;
-                    delete clean.url;
-                    delete clean.streamUrl;
-                    return clean;
-                  });
-                }
-
-                params.push(
-                  id,
-                  kind,
-                  name,
-                  JSON.stringify(metadata)
-                );
-
-                return "(?, ?, ?, ?)";
-              });
-
-              const sql = `
-                INSERT INTO catalog (id, kind, name, data)
-                VALUES ${placeholders.join(",")}
-                ON CONFLICT(id) DO UPDATE SET
-                  kind = excluded.kind,
-                  name = excluded.name,
-                  data = excluded.data
-              `;
-
-              await query(sql, params);
-              imported += batch.length;
-
-              console.log(`Imported ${imported}/${items.length}`);
+            const batches = [];
+            for (let i = 0; i < items.length; i += BATCH) {
+              batches.push(items.slice(i, i + BATCH));
             }
 
-            console.log(`SUCCESS: ${imported} catalog items processed.`);
+            let next = 0;
+            let completed = 0;
+            let failed = 0;
+
+            async function worker() {
+              while (true) {
+                const index = next++;
+                if (index >= batches.length) return;
+
+                const batch = batches[index];
+
+                try {
+                  const params = [];
+                  const values = batch.map((item, offset) => {
+                    const id = String(
+                      item.id || item.slug || item.name || ""
+                    ).trim();
+
+                    if (!id) {
+                      throw new Error(
+                        `Missing ID in batch ${index + 1}, item ${offset + 1}`
+                      );
+                    }
+
+                    const metadata = { ...item };
+                    delete metadata.links;
+
+                    if (Array.isArray(metadata.episodes)) {
+                      metadata.episodes = metadata.episodes.map(ep => {
+                        const clean = { ...ep };
+                        delete clean.links;
+                        delete clean.url;
+                        delete clean.streamUrl;
+                        return clean;
+                      });
+                    }
+
+                    params.push(
+                      id,
+                      String(item.kind || "movie"),
+                      String(item.name || ""),
+                      JSON.stringify(metadata)
+                    );
+
+                    return "(?, ?, ?, ?)";
+                  });
+
+                  await query(`
+                    INSERT INTO catalog (id, kind, name, data)
+                    VALUES ${values.join(",")}
+                    ON CONFLICT(id) DO UPDATE SET
+                      kind = excluded.kind,
+                      name = excluded.name,
+                      data = excluded.data
+                  `, params);
+
+                  completed += batch.length;
+                  if (completed % 100 === 0 || completed === items.length) {
+                    console.log(`Progress: ${completed}/${items.length}`);
+                  }
+                } catch (e) {
+                  failed += batch.length;
+                  console.error(`Batch ${index + 1} failed: ${e.message}`);
+                  throw e;
+                }
+              }
+            }
+
+            await Promise.all(
+              Array.from({ length: PARALLEL }, () => worker())
+            );
+
+            console.log(
+              `Import complete. Items processed: ${completed}; failed: ${failed}`
+            );
+
+            const check = await query(
+              "SELECT COUNT(*) AS total FROM catalog"
+            );
+            console.log("D1 catalog count:", JSON.stringify(check.result));
           }
 
           main().catch(error => {
-            console.error(error);
+            console.error("IMPORT FAILED:", error.message);
             process.exit(1);
           });
           JS
 
-          node import-catalog.js
+          node import.js
