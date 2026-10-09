@@ -1,0 +1,125 @@
+
+name: Sync Cloudflare Catalog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-cloudflare-catalog
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download and validate Cloudflare catalog
+        env:
+          WORKER_URL: https://ctgmovies-api.proshantobarua70-4a5.workers.dev/movies
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const zlib = require("zlib");
+
+          async function main() {
+            const file = "data.json.gz";
+
+            const response = await fetch(process.env.WORKER_URL, {
+              headers: { Accept: "application/json" },
+              signal: AbortSignal.timeout(45000)
+            });
+
+            if (!response.ok) {
+              throw new Error(`Worker HTTP ${response.status}`);
+            }
+
+            const payload = await response.json();
+            if (!payload || !Array.isArray(payload.items)) {
+              throw new Error("Worker response-e items array nai");
+            }
+
+            const items = payload.items;
+            if (items.length === 0) {
+              throw new Error("Worker 0 items dise; old catalog safe rakha holo");
+            }
+
+            let oldItems = [];
+            try {
+              const old = JSON.parse(
+                zlib.gunzipSync(fs.readFileSync(file)).toString("utf8")
+              );
+              oldItems = Array.isArray(old.items) ? old.items : [];
+            } catch {}
+
+            console.log(`Cloudflare items: ${items.length}`);
+            console.log(`Existing GitHub items: ${oldItems.length}`);
+
+            if (oldItems.length && items.length < oldItems.length) {
+              throw new Error(
+                "Cloudflare catalog choto; data overwrite kora holo na"
+              );
+            }
+
+            if (JSON.stringify(items) === JSON.stringify(oldItems)) {
+              console.log("Catalog unchanged; upload dorkar nai.");
+              fs.writeFileSync("catalog-unchanged.txt", "unchanged");
+              return;
+            }
+
+            const json = JSON.stringify({
+              updated: payload.updated || new Date().toISOString(),
+              items
+            });
+
+            // Level 1 = faster gzip; data already compressed for Git transfer.
+            fs.writeFileSync(
+              file,
+              zlib.gzipSync(Buffer.from(json), { level: 1 })
+            );
+
+            console.log(`Prepared ${items.length} items for upload.`);
+          }
+
+          main().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Commit and push catalog
+        run: |
+          if [ -f catalog-unchanged.txt ]; then
+            echo "No catalog changes; skipping commit."
+            exit 0
+          fi
+
+          if git diff --quiet -- data.json.gz; then
+            echo "No file changes; skipping commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.compression 0
+
+          git add data.json.gz
+          git commit -m "Sync Cloudflare catalog"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          echo "Catalog sync and Git push complete."
