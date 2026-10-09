@@ -1,288 +1,124 @@
 
-const API = "https://ctgmovies-api-new.proshantobarua041.workers.dev";
-const PAGE = 100;
+name: Import Catalog to Cloudflare D1
 
-const manifest = {
-  id: "com.mhthe1.ctgmovies.bridge",
-  version: "3.1.0",
-  name: "CTGMovies Bridge",
-  description: "CTGMovies catalog and streams through Cloudflare D1",
-  logo: "https://dhakastremio.mehedihtanvir.me/icon.svg",
-  resources: [
-    "catalog",
-    { name: "meta", types: ["movie", "series"], idPrefixes: ["ctg:"] },
-    { name: "stream", types: ["movie", "series"], idPrefixes: ["ctg:"] }
-  ],
-  types: ["movie", "series"],
-  catalogs: [
-    {
-      type: "movie",
-      id: "ctg_movies",
-      name: "CTGMovies Movies",
-      extra: [
-        { name: "search", isRequired: false },
-        { name: "skip", isRequired: false }
-      ]
-    },
-    {
-      type: "series",
-      id: "ctg_tv",
-      name: "CTGMovies TV Shows",
-      extra: [
-        { name: "search", isRequired: false },
-        { name: "skip", isRequired: false }
-      ]
-    },
-    {
-      type: "series",
-      id: "ctg_anime",
-      name: "CTGMovies Anime",
-      extra: [
-        { name: "search", isRequired: false },
-        { name: "skip", isRequired: false }
-      ]
-    }
-  ],
-  behaviorHints: {
-    configurable: false,
-    configurationRequired: false
-  }
-};
+on:
+  workflow_dispatch:
 
-const CAT_KIND = {
-  ctg_movies: "movies",
-  ctg_tv: "tv",
-  ctg_anime: "anime"
-};
+permissions:
+  contents: read
 
-let cache = null;
-let cacheTime = 0;
+concurrency:
+  group: ctg-d1-import
+  cancel-in-progress: false
 
-async function getItems() {
-  if (cache && Date.now() - cacheTime < 60000) {
-    return cache;
-  }
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
 
-  const all = [];
-  const seen = new Set();
-  const pageSize = 50;
+    steps:
+      - uses: actions/checkout@v4
 
-  for (let skip = 0; skip < 100000; skip += pageSize) {
-    const url = `${API}/movies?skip=${skip}&limit=${pageSize}`;
-    const response = await fetch(url, {
-      headers: { Accept: "application/json" }
-    });
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-    if (!response.ok) {
-      throw new Error(`Cloudflare API HTTP ${response.status}`);
-    }
+      - name: Import catalog and preserve stream links
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_ID: ${{ secrets.D1_DATABASE_ID }}
+        run: |
+          cat > import.js <<'JS'
+          const fs = require("fs");
+          const zlib = require("zlib");
 
-    const data = await response.json();
-    const items = Array.isArray(data.items) ? data.items : [];
+          async function main() {
+            const { CF_TOKEN, CF_ACCOUNT, D1_ID } = process.env;
+            if (!CF_TOKEN || !CF_ACCOUNT || !D1_ID) {
+              throw new Error("Cloudflare secrets missing");
+            }
 
-    for (const item of items) {
-      if (item.id && !seen.has(item.id)) {
-        seen.add(item.id);
-        all.push(item);
-      }
-    }
+            const raw = zlib.gunzipSync(
+              fs.readFileSync("data.json.gz")
+            ).toString("utf8");
 
-    if (items.length < pageSize) break;
-  }
+            const parsed = JSON.parse(raw);
+            const items = Array.isArray(parsed) ? parsed : parsed.items;
 
-  cache = all;
-  cacheTime = Date.now();
-  return cache;
-}
+            if (!Array.isArray(items) || !items.length) {
+              throw new Error("Catalog empty; import stopped");
+            }
 
-function typeOf(kind) {
-  return kind === "movies" ? "movie" : "series";
-}
+            const endpoint =
+              `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/d1/database/${D1_ID}/query`;
 
-function card(item) {
-  return {
-    id: item.id,
-    type: typeOf(item.kind),
-    name: item.name,
-    poster: item.poster || undefined,
-    releaseInfo: item.year != null ? String(item.year) : undefined
-  };
-}
+            async function query(sql, params = []) {
+              const r = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${CF_TOKEN}`,
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ sql, params })
+              });
 
-function parseExtra(str) {
-  const out = {};
-  if (!str) return out;
+              const result = await r.json();
+              if (!r.ok || !result.success) {
+                throw new Error(JSON.stringify(result.errors || result));
+              }
+              return result;
+            }
 
-  for (const part of str.split("&")) {
-    const i = part.indexOf("=");
-    if (i < 0) continue;
+            await query(`
+              CREATE TABLE IF NOT EXISTS catalog (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                name TEXT,
+                data TEXT NOT NULL
+              )
+            `);
 
-    const key = part.slice(0, i);
-    const value = part.slice(i + 1);
+            const batchSize = 10;
+            let done = 0;
 
-    try {
-      out[key] = decodeURIComponent(value);
-    } catch {
-      out[key] = value;
-    }
-  }
+            for (let i = 0; i < items.length; i += batchSize) {
+              const batch = items.slice(i, i + batchSize);
+              const params = [];
+              const values = batch.map(item => {
+                const id = String(item.id || item.slug || item.name || "").trim();
+                if (!id) throw new Error("Catalog item missing ID");
 
-  return out;
-}
+                // Preserve movie links and episode links.
+                params.push(
+                  id,
+                  String(item.kind || "movie"),
+                  String(item.name || ""),
+                  JSON.stringify(item)
+                );
+                return "(?, ?, ?, ?)";
+              });
 
-async function catalog(id, extra) {
-  const kind = CAT_KIND[id];
-  if (!kind) return { metas: [] };
+              await query(`
+                INSERT INTO catalog (id, kind, name, data)
+                VALUES ${values.join(",")}
+                ON CONFLICT(id) DO UPDATE SET
+                  kind = excluded.kind,
+                  name = excluded.name,
+                  data = excluded.data
+              `, params);
 
-  let items = (await getItems()).filter(item => item.kind === kind);
+              done += batch.length;
+              console.log(`Imported ${done}/${items.length}`);
+            }
 
-  if (extra.search) {
-    const q = extra.search.toLowerCase();
-    items = items.filter(item =>
-      String(item.name || "").toLowerCase().includes(q)
-    );
-  }
+            console.log("Import complete:", done);
+          }
 
-  const skip = Math.max(0, parseInt(extra.skip || "0", 10) || 0);
+          main().catch(e => {
+            console.error(e);
+            process.exit(1);
+          });
+          JS
 
-  return {
-    metas: items.slice(skip, skip + PAGE).map(card)
-  };
-}
-
-async function meta(id) {
-  const items = await getItems();
-  const item = items.find(x => x.id === id);
-
-  if (!item) return { meta: null };
-
-  const result = {
-    id: item.id,
-    type: typeOf(item.kind),
-    name: item.name,
-    poster: item.poster || undefined,
-    background: item.backdrop || undefined,
-    description: item.overview || undefined,
-    releaseInfo: item.year != null ? String(item.year) : undefined,
-    imdbRating: item.rating != null ? String(item.rating) : undefined
-  };
-
-  if (item.kind !== "movies") {
-    result.videos = (item.episodes || []).map(ep => ({
-      id: `${item.id}:${ep.s}:${ep.e}`,
-      title: ep.name || `Episode ${ep.e}`,
-      season: ep.s,
-      episode: ep.e,
-      overview: ep.overview,
-      thumbnail: ep.still,
-      released: ep.air
-        ? new Date(ep.air).toISOString()
-        : new Date(0).toISOString()
-    }));
-  }
-
-  return { meta: result };
-}
-
-function makeStreams(links) {
-  return (links || [])
-    .filter(link => link && typeof link.url === "string" && link.url)
-    .map(link => ({
-      name: `CTGMovies\n${link.quality || "Direct"}`,
-      title: `${link.quality || "Direct"} (${link.source || "Server"})`,
-      url: link.url,
-      behaviorHints: {
-        notWebReady: true,
-        proxyHeaders: {
-          request: { Referer: "https://ctgmovies.com/" }
-        }
-      }
-    }));
-}
-
-async function stream(id) {
-  const items = await getItems();
-
-  // Movie ID
-  const movie = items.find(item => item.id === id);
-  if (movie && movie.kind === "movies") {
-    return { streams: makeStreams(movie.links) };
-  }
-
-  // Series episode ID: ctg:tv:slug:season:episode
-  // Match the full ID generated by meta().
-  for (const item of items) {
-    if (item.kind === "movies") continue;
-
-    const episode = (item.episodes || []).find(
-      ep => `${item.id}:${ep.s}:${ep.e}` === id
-    );
-
-    if (episode) {
-      return { streams: makeStreams(episode.links) };
-    }
-  }
-
-  return { streams: [] };
-}
-
-module.exports = async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-
-  const parts = decodeURIComponent((req.url || "/").split("?")[0])
-    .replace(/\.json$/, "")
-    .split("/")
-    .filter(Boolean);
-
-  const resource = parts[0];
-  const type = parts[1];
-  const id = parts[2];
-  const extra = parseExtra(parts[3]);
-
-  try {
-    if (!resource || resource === "manifest") {
-      return res.status(200).json(manifest);
-    }
-
-    if (resource === "status") {
-      const items = await getItems();
-
-      return res.status(200).json({
-        source: "Cloudflare D1",
-        api: API,
-        items: items.length,
-        movies: items.filter(x => x.kind === "movies").length,
-        tv: items.filter(x => x.kind === "tv").length,
-        anime: items.filter(x => x.kind === "anime").length
-      });
-    }
-
-    if (resource === "catalog") {
-      return res.status(200).json(await catalog(id, extra));
-    }
-
-    if (resource === "meta") {
-      return res.status(200).json(await meta(id));
-    }
-
-    if (resource === "stream") {
-      return res.status(200).json(await stream(id, type));
-    }
-
-    return res.status(404).json({ error: "not found" });
-  } catch (error) {
-    console.error(error);
-
-    return res.status(500).json({
-      error: error.message,
-      streams: resource === "stream" ? [] : undefined
-    });
-  }
-};
+          node import.js
