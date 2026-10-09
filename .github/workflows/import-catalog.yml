@@ -1,0 +1,161 @@
+
+name: Import Catalog to Cloudflare D1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Import catalog
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+        run: |
+          cat > import-catalog.js <<'JS'
+          const fs = require("fs");
+          const zlib = require("zlib");
+
+          async function main() {
+            for (const key of [
+              "CLOUDFLARE_API_TOKEN",
+              "CLOUDFLARE_ACCOUNT_ID",
+              "D1_DATABASE_ID"
+            ]) {
+              if (!process.env[key]) throw new Error(`Missing secret: ${key}`);
+            }
+
+            if (!fs.existsSync("data.json.gz")) {
+              throw new Error("data.json.gz not found in repository root");
+            }
+
+            const raw = zlib.gunzipSync(
+              fs.readFileSync("data.json.gz")
+            ).toString("utf8");
+
+            const parsed = JSON.parse(raw);
+            const items = Array.isArray(parsed) ? parsed : parsed.items;
+
+            if (!Array.isArray(items) || items.length === 0) {
+              throw new Error("Catalog is empty or JSON format is invalid");
+            }
+
+            const token = process.env.CLOUDFLARE_API_TOKEN;
+            const account = process.env.CLOUDFLARE_ACCOUNT_ID;
+            const database = process.env.D1_DATABASE_ID;
+            const endpoint =
+              `https://api.cloudflare.com/client/v4/accounts/${account}/d1/database/${database}/query`;
+
+            async function query(sql, params = []) {
+              const response = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                  "Authorization": `Bearer ${token}`,
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ sql, params })
+              });
+
+              const result = await response.json();
+
+              if (!response.ok || !result.success) {
+                throw new Error(JSON.stringify(result.errors || result));
+              }
+
+              return result;
+            }
+
+            await query(`
+              CREATE TABLE IF NOT EXISTS catalog (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                name TEXT,
+                data TEXT NOT NULL
+              )
+            `);
+
+            await query(
+              "CREATE INDEX IF NOT EXISTS idx_catalog_kind ON catalog(kind)"
+            );
+
+            await query(
+              "CREATE INDEX IF NOT EXISTS idx_catalog_name ON catalog(name)"
+            );
+
+            const batchSize = 50;
+            let imported = 0;
+
+            for (let start = 0; start < items.length; start += batchSize) {
+              const batch = items.slice(start, start + batchSize);
+              const params = [];
+              const placeholders = batch.map(item => {
+                const id = String(item.id || item.slug || item.name || "").trim();
+                if (!id) throw new Error("An item has no usable ID");
+
+                const kind = String(item.kind || "movie");
+                const name = String(item.name || "");
+
+                // Store catalog metadata, not direct playback URLs.
+                const metadata = { ...item };
+                delete metadata.links;
+
+                if (Array.isArray(metadata.episodes)) {
+                  metadata.episodes = metadata.episodes.map(ep => {
+                    const clean = { ...ep };
+                    delete clean.links;
+                    delete clean.url;
+                    delete clean.streamUrl;
+                    return clean;
+                  });
+                }
+
+                params.push(
+                  id,
+                  kind,
+                  name,
+                  JSON.stringify(metadata)
+                );
+
+                return "(?, ?, ?, ?)";
+              });
+
+              const sql = `
+                INSERT INTO catalog (id, kind, name, data)
+                VALUES ${placeholders.join(",")}
+                ON CONFLICT(id) DO UPDATE SET
+                  kind = excluded.kind,
+                  name = excluded.name,
+                  data = excluded.data
+              `;
+
+              await query(sql, params);
+              imported += batch.length;
+
+              console.log(`Imported ${imported}/${items.length}`);
+            }
+
+            console.log(`SUCCESS: ${imported} catalog items processed.`);
+          }
+
+          main().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          JS
+
+          node import-catalog.js
