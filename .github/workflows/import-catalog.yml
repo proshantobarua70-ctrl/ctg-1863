@@ -1,4 +1,4 @@
-
+```yaml
 name: Import Catalog to Cloudflare D1
 
 on:
@@ -30,15 +30,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -s data.json.gz || {
-            echo "ERROR: data.json.gz missing or empty"
-            exit 1
-          }
+
+          test -s data.json.gz
           test -n "$CLOUDFLARE_ACCOUNT_ID"
           test -n "$CLOUDFLARE_API_TOKEN"
           test -n "$D1_DATABASE_ID"
 
-          node -e "require('zlib').gunzipSync(require('fs').readFileSync('data.json.gz')); console.log('GZIP file valid')"
+          node -e "const z=require('zlib'),f=require('fs');const d=JSON.parse(z.gunzipSync(f.readFileSync('data.json.gz')));const a=Array.isArray(d)?d:d.items;if(!Array.isArray(a)||!a.length)throw Error('Catalog is empty');console.log('GZIP valid; catalog records:',a.length)"
 
           cat > wrangler.toml <<EOF
           name = "ctgmovies-d1-import"
@@ -49,6 +47,34 @@ jobs:
           database_name = "ctgmovies"
           database_id = "$D1_DATABASE_ID"
           EOF
+
+      - name: Create D1 table
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npx --yes wrangler@4 d1 execute ctgmovies \
+            --remote \
+            --command="CREATE TABLE IF NOT EXISTS movies (
+              id TEXT PRIMARY KEY,
+              kind TEXT,
+              slug TEXT,
+              name TEXT,
+              poster TEXT,
+              backdrop TEXT,
+              year INTEGER,
+              overview TEXT,
+              rating REAL,
+              genres TEXT,
+              runtime INTEGER,
+              imdb TEXT,
+              tmdb TEXT,
+              trailer TEXT,
+              episodes TEXT,
+              detail_url TEXT,
+              links TEXT,
+              updated_at TEXT
+            );"
 
       - name: Prepare SQL import batches
         shell: bash
@@ -67,20 +93,16 @@ jobs:
           const data = JSON.parse(raw);
           const items = Array.isArray(data) ? data : data.items;
 
-          if (!Array.isArray(items) || items.length === 0) {
-            throw new Error("No catalog items found in data.json.gz");
-          }
-
-          function q(s) {
-            return "'" + String(s).replace(/'/g, "''") + "'";
+          if (!Array.isArray(items) || !items.length) {
+            throw new Error("No catalog items found");
           }
 
           function val(v) {
             if (v === undefined || v === null || v === "") return "NULL";
             if (typeof v === "number" && Number.isFinite(v)) return String(v);
             if (typeof v === "boolean") return v ? "1" : "0";
-            if (typeof v === "object") return q(JSON.stringify(v));
-            return q(v);
+            const s = typeof v === "object" ? JSON.stringify(v) : String(v);
+            return "'" + s.replace(/'/g, "''") + "'";
           }
 
           const columns = [
@@ -93,7 +115,7 @@ jobs:
           const now = new Date().toISOString();
           const valid = items.filter(x => x && x.id);
 
-          if (!valid.length) throw new Error("No records with an id");
+          if (!valid.length) throw new Error("No records with id");
 
           let batch = [];
           let fileNo = 0;
@@ -101,11 +123,11 @@ jobs:
           function flush() {
             if (!batch.length) return;
             fileNo++;
-            const filename =
+            fs.writeFileSync(
               "/tmp/d1-import/chunk-" +
-              String(fileNo).padStart(4, "0") + ".sql";
-
-            fs.writeFileSync(filename, batch.join("\n") + "\n");
+                String(fileNo).padStart(4, "0") + ".sql",
+              batch.join("\n") + "\n"
+            );
             batch = [];
           }
 
@@ -116,30 +138,17 @@ jobs:
                 : null);
 
             const values = [
-              item.id,
-              item.kind,
-              item.slug,
-              item.name,
-              item.poster,
-              item.backdrop,
-              item.year,
-              item.overview,
-              item.rating,
-              item.genres,
-              item.runtime,
-              item.imdb,
-              item.tmdb,
-              item.trailer,
-              item.episodes,
-              detailUrl,
-              item.links,
-              now
+              item.id, item.kind, item.slug, item.name,
+              item.poster, item.backdrop, item.year, item.overview,
+              item.rating, item.genres, item.runtime, item.imdb,
+              item.tmdb, item.trailer, item.episodes, detailUrl,
+              item.links, now
             ];
 
             batch.push(
               "INSERT OR REPLACE INTO movies (" +
-              columns.join(", ") +
-              ") VALUES (" + values.map(val).join(", ") + ");"
+              columns.join(", ") + ") VALUES (" +
+              values.map(val).join(", ") + ");"
             );
 
             if (batch.length >= 100) flush();
@@ -150,7 +159,7 @@ jobs:
           console.log("SQL batches:", fileNo);
           NODE
 
-      - name: Import into Cloudflare D1
+      - name: Import catalog into D1
         shell: bash
         run: |
           set -euo pipefail
@@ -161,4 +170,13 @@ jobs:
               --remote --file="$file"
           done
 
-          echo "All SQL batches completed."
+          echo "Catalog import completed."
+
+      - name: Verify imported records
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4 d1 execute ctgmovies \
+            --remote \
+            --command="SELECT COUNT(*) AS total_records FROM movies;"
+```
