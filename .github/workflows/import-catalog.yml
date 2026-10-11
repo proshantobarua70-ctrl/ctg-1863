@@ -17,10 +17,10 @@ jobs:
       D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -37,11 +37,10 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const zlib = require("zlib");
-          const data = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")).toString("utf8"));
-          const items = Array.isArray(data) ? data : data.items;
-          if (!Array.isArray(items) || !items.length) throw Error("Catalog empty");
-          if (!items.some(x => x && x.id)) throw Error("No IDs found");
-          console.log("Catalog records:", items.length);
+          const d = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")));
+          const a = Array.isArray(d) ? d : d.items;
+          if (!Array.isArray(a) || !a.some(x => x && x.id)) throw Error("Invalid catalog");
+          console.log("Records:", a.length);
           NODE
 
           cat > wrangler.toml <<EOF
@@ -54,13 +53,13 @@ jobs:
           database_id = "$D1_DATABASE_ID"
           EOF
 
-      - name: Create D1 table
+      - name: Create table
         shell: bash
         run: |
           set -euo pipefail
           npx --yes wrangler@4 d1 execute ctgmovies --remote --command="CREATE TABLE IF NOT EXISTS movies (id TEXT PRIMARY KEY, kind TEXT, slug TEXT, name TEXT, poster TEXT, backdrop TEXT, year INTEGER, overview TEXT, rating REAL, genres TEXT, runtime INTEGER, imdb TEXT, tmdb TEXT, trailer TEXT, episodes TEXT, detail_url TEXT, links TEXT, updated_at TEXT);"
 
-      - name: Prepare SQL batches
+      - name: Prepare small SQL files
         shell: bash
         run: |
           set -euo pipefail
@@ -69,54 +68,46 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const zlib = require("zlib");
-          const data = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")).toString("utf8"));
-          const items = (Array.isArray(data) ? data : data.items).filter(x => x && x.id);
+          const d = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")));
+          const items = (Array.isArray(d) ? d : d.items).filter(x => x && x.id);
 
           const cols = ["id","kind","slug","name","poster","backdrop","year","overview","rating","genres","runtime","imdb","tmdb","trailer","episodes","detail_url","links","updated_at"];
-          const MAX_FIELD_CHARS = 6000;
-          const MAX_STATEMENTS = 100;
-          const MAX_FILE_BYTES = 250 * 1024;
+          const MAX_FILE_BYTES = 70 * 1024;
+          const MAX_FIELD = 6000;
           const now = new Date().toISOString();
 
           function raw(v) {
-            if (v === undefined || v === null || v === "") return null;
-            if (typeof v === "object") return JSON.stringify(v);
-            return String(v);
+            if (v == null || v === "") return null;
+            return typeof v === "object" ? JSON.stringify(v) : String(v);
           }
 
-          function quote(s) {
+          function q(s) {
             return "'" + s.replace(/'/g, "''") + "'";
           }
 
           function val(v) {
-            if (v === undefined || v === null || v === "") return "NULL";
+            if (v == null || v === "") return "NULL";
             if (typeof v === "number" && Number.isFinite(v)) return String(v);
             if (typeof v === "boolean") return v ? "1" : "0";
-            return quote(raw(v));
+            return q(raw(v));
           }
 
-          let statements = [];
-          let bytes = 0;
-          let part = 0;
-          let largeFields = 0;
+          let lines = [], bytes = 0, part = 0, records = 0, chunks = 0;
 
           function flush() {
-            if (!statements.length) return;
-            const file = "/tmp/d1-import/chunk-" + String(++part).padStart(5, "0") + ".sql";
-            fs.writeFileSync(file, statements.join("\n") + "\n");
-            statements = [];
+            if (!lines.length) return;
+            const name = "/tmp/d1-import/chunk-" + String(++part).padStart(5, "0") + ".sql";
+            fs.writeFileSync(name, lines.join("\n") + "\n");
+            lines = [];
             bytes = 0;
           }
 
           function add(sql) {
-            const size = Buffer.byteLength(sql, "utf8") + 1;
-            if (size > 20000) throw Error("SQL statement too large: " + size);
-            if (statements.length &&
-                (statements.length >= MAX_STATEMENTS || bytes + size > MAX_FILE_BYTES)) {
-              flush();
-            }
-            statements.push(sql);
-            bytes += size;
+            const n = Buffer.byteLength(sql, "utf8") + 1;
+            if (n > MAX_FILE_BYTES) throw Error("Single SQL line too large: " + n);
+            if (bytes + n > MAX_FILE_BYTES) flush();
+            lines.push(sql);
+            bytes += n;
           }
 
           for (const x of items) {
@@ -133,26 +124,25 @@ jobs:
             const updates = [];
 
             for (let i = 0; i < cols.length; i++) {
-              const original = values[i];
-              const s = raw(original);
+              const v = values[i], s = raw(v);
 
               if (s !== null &&
-                  typeof original !== "number" &&
-                  typeof original !== "boolean" &&
-                  s.length > MAX_FIELD_CHARS) {
+                  typeof v !== "number" &&
+                  typeof v !== "boolean" &&
+                  s.length > MAX_FIELD) {
                 stored.push("NULL");
-                largeFields++;
+                chunks++;
 
-                for (let pos = 0; pos < s.length; pos += MAX_FIELD_CHARS) {
-                  const piece = s.slice(pos, pos + MAX_FIELD_CHARS);
+                for (let p = 0; p < s.length; p += MAX_FIELD) {
                   updates.push(
                     "UPDATE movies SET " + cols[i] +
                     " = COALESCE(" + cols[i] + ",'') || " +
-                    quote(piece) + " WHERE id = " + val(x.id) + ";"
+                    q(s.slice(p, p + MAX_FIELD)) +
+                    " WHERE id = " + val(x.id) + ";"
                   );
                 }
               } else {
-                stored.push(val(original));
+                stored.push(val(v));
               }
             }
 
@@ -160,15 +150,16 @@ jobs:
                 ") VALUES (" + stored.join(",") + ");");
 
             for (const sql of updates) add(sql);
+            records++;
           }
 
           flush();
-          console.log("Records:", items.length);
-          console.log("SQL batches:", part);
-          console.log("Large fields chunked:", largeFields);
+          console.log("Records:", records);
+          console.log("SQL files:", part);
+          console.log("Large fields split:", chunks);
           NODE
 
-      - name: Import catalog into D1
+      - name: Import catalog
         shell: bash
         run: |
           set -euo pipefail
@@ -177,7 +168,7 @@ jobs:
             npx --yes wrangler@4 d1 execute ctgmovies --remote --file="$file"
           done
 
-      - name: Verify imported records
+      - name: Verify
         shell: bash
         run: |
           set -euo pipefail
