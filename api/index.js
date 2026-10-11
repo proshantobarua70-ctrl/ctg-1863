@@ -1,5 +1,5 @@
 
-const API = "https://ctgmovies-api-new.proshantobarua041.workers.dev";
+const API = "https://ctgmovies-api.proshantobarua70-4a5.workers.dev";
 
 let cache = null;
 let cacheTime = 0;
