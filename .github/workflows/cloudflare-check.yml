@@ -1,7 +1,7 @@
 ```yaml
 name: Cloudflare Connection Check
 
-on:
+'on':
   workflow_dispatch:
 
 permissions:
@@ -10,22 +10,10 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
-
     steps:
       - name: Check Worker
-        run: |
-          set -e
-          curl --fail --show-error --silent \
-            --max-time 20 \
-            https://ctgmovies-api.proshantobarua70-4a5.workers.dev/ping
+        run: curl -fsS --max-time 20 https://ctgmovies-api.proshantobarua70-4a5.workers.dev/ping
 
       - name: Check Database
-        run: |
-          set -e
-          curl --fail --show-error --silent \
-            --max-time 20 \
-            https://ctgmovies-api.proshantobarua70-4a5.workers.dev/db
-          echo ""
-          echo "Cloudflare connection check completed."
+        run: curl -fsS --max-time 20 https://ctgmovies-api.proshantobarua70-4a5.workers.dev/db
 ```
