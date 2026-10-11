@@ -1,4 +1,3 @@
-```yaml
 name: Import Catalog to Cloudflare D1
 
 on:
@@ -26,7 +25,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Validate credentials and catalog
+      - name: Validate catalog
         shell: bash
         run: |
           set -euo pipefail
@@ -40,9 +39,9 @@ jobs:
           const zlib = require("zlib");
           const data = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")).toString("utf8"));
           const items = Array.isArray(data) ? data : data.items;
-          if (!Array.isArray(items) || !items.length) throw new Error("Catalog empty or invalid");
-          if (!items.some(x => x && x.id)) throw new Error("No catalog IDs found");
-          console.log("Catalog validated:", items.length, "items");
+          if (!Array.isArray(items) || !items.length) throw new Error("Catalog empty");
+          if (!items.some(x => x && x.id)) throw new Error("No item IDs found");
+          console.log("Catalog items:", items.length);
           NODE
 
           cat > wrangler.toml <<EOF
@@ -55,7 +54,7 @@ jobs:
           database_id = "$D1_DATABASE_ID"
           EOF
 
-      - name: Create table
+      - name: Create D1 table
         shell: bash
         run: |
           set -euo pipefail
@@ -80,7 +79,7 @@ jobs:
             updated_at TEXT
           );"
 
-      - name: Build SQL batches
+      - name: Prepare SQL batches
         shell: bash
         run: |
           set -euo pipefail
@@ -105,14 +104,17 @@ jobs:
             "rating","genres","runtime","imdb","tmdb","trailer","episodes",
             "detail_url","links","updated_at"
           ];
+
           const valid = items.filter(x => x && x.id);
           const now = new Date().toISOString();
-          let batch = [], part = 0;
+          let batch = [];
+          let part = 0;
 
           function flush() {
             if (!batch.length) return;
+            part++;
             fs.writeFileSync(
-              `/tmp/d1-import/chunk-${String(++part).padStart(4,"0")}.sql`,
+              "/tmp/d1-import/chunk-" + String(part).padStart(4, "0") + ".sql",
               batch.join("\n") + "\n"
             );
             batch = [];
@@ -120,23 +122,27 @@ jobs:
 
           for (const x of valid) {
             const detail = x.detail_url ||
-              (x.kind && x.slug ? `https://ctgmovies.com/${x.kind}/${x.slug}` : null);
+              (x.kind && x.slug ? "https://ctgmovies.com/" + x.kind + "/" + x.slug : null);
+
             const values = [
               x.id,x.kind,x.slug,x.name,x.poster,x.backdrop,x.year,x.overview,
               x.rating,x.genres,x.runtime,x.imdb,x.tmdb,x.trailer,x.episodes,
               detail,x.links,now
             ];
+
             batch.push(
               "INSERT OR REPLACE INTO movies (" + cols.join(",") +
               ") VALUES (" + values.map(val).join(",") + ");"
             );
+
             if (batch.length >= 100) flush();
           }
+
           flush();
-          console.log("Records:", valid.length, "SQL batches:", part);
+          console.log("Records:", valid.length, "Batches:", part);
           NODE
 
-      - name: Import catalog
+      - name: Import catalog into D1
         shell: bash
         run: |
           set -euo pipefail
@@ -149,7 +155,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npx --yes wrangler@4 d1 execute ctgmovies \
-            --remote \
-            --command="SELECT COUNT(*) AS total_records FROM movies;"
-```
+          npx --yes wrangler@4 d1 execute ctgmovies --remote --command="SELECT COUNT(*) AS total_records FROM movies;"
