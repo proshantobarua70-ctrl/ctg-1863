@@ -26,17 +26,24 @@ jobs:
         with:
           node-version: 20
 
-      - name: Validate source and credentials
+      - name: Validate credentials and catalog
         shell: bash
         run: |
           set -euo pipefail
-
           test -s data.json.gz
           test -n "$CLOUDFLARE_ACCOUNT_ID"
           test -n "$CLOUDFLARE_API_TOKEN"
           test -n "$D1_DATABASE_ID"
 
-          node -e "const z=require('zlib'),f=require('fs');const d=JSON.parse(z.gunzipSync(f.readFileSync('data.json.gz')));const a=Array.isArray(d)?d:d.items;if(!Array.isArray(a)||!a.length)throw Error('Catalog is empty');console.log('GZIP valid; catalog records:',a.length)"
+          node <<'NODE'
+          const fs = require("fs");
+          const zlib = require("zlib");
+          const data = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")).toString("utf8"));
+          const items = Array.isArray(data) ? data : data.items;
+          if (!Array.isArray(items) || !items.length) throw new Error("Catalog empty or invalid");
+          if (!items.some(x => x && x.id)) throw new Error("No catalog IDs found");
+          console.log("Catalog validated:", items.length, "items");
+          NODE
 
           cat > wrangler.toml <<EOF
           name = "ctgmovies-d1-import"
@@ -48,35 +55,32 @@ jobs:
           database_id = "$D1_DATABASE_ID"
           EOF
 
-      - name: Create D1 table
+      - name: Create table
         shell: bash
         run: |
           set -euo pipefail
+          npx --yes wrangler@4 d1 execute ctgmovies --remote --command="CREATE TABLE IF NOT EXISTS movies (
+            id TEXT PRIMARY KEY,
+            kind TEXT,
+            slug TEXT,
+            name TEXT,
+            poster TEXT,
+            backdrop TEXT,
+            year INTEGER,
+            overview TEXT,
+            rating REAL,
+            genres TEXT,
+            runtime INTEGER,
+            imdb TEXT,
+            tmdb TEXT,
+            trailer TEXT,
+            episodes TEXT,
+            detail_url TEXT,
+            links TEXT,
+            updated_at TEXT
+          );"
 
-          npx --yes wrangler@4 d1 execute ctgmovies \
-            --remote \
-            --command="CREATE TABLE IF NOT EXISTS movies (
-              id TEXT PRIMARY KEY,
-              kind TEXT,
-              slug TEXT,
-              name TEXT,
-              poster TEXT,
-              backdrop TEXT,
-              year INTEGER,
-              overview TEXT,
-              rating REAL,
-              genres TEXT,
-              runtime INTEGER,
-              imdb TEXT,
-              tmdb TEXT,
-              trailer TEXT,
-              episodes TEXT,
-              detail_url TEXT,
-              links TEXT,
-              updated_at TEXT
-            );"
-
-      - name: Prepare SQL import batches
+      - name: Build SQL batches
         shell: bash
         run: |
           set -euo pipefail
@@ -85,17 +89,8 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const zlib = require("zlib");
-
-          const raw = zlib.gunzipSync(
-            fs.readFileSync("data.json.gz")
-          ).toString("utf8");
-
-          const data = JSON.parse(raw);
+          const data = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")).toString("utf8"));
           const items = Array.isArray(data) ? data : data.items;
-
-          if (!Array.isArray(items) || !items.length) {
-            throw new Error("No catalog items found");
-          }
 
           function val(v) {
             if (v === undefined || v === null || v === "") return "NULL";
@@ -105,72 +100,50 @@ jobs:
             return "'" + s.replace(/'/g, "''") + "'";
           }
 
-          const columns = [
-            "id", "kind", "slug", "name", "poster", "backdrop",
-            "year", "overview", "rating", "genres", "runtime",
-            "imdb", "tmdb", "trailer", "episodes", "detail_url",
-            "links", "updated_at"
+          const cols = [
+            "id","kind","slug","name","poster","backdrop","year","overview",
+            "rating","genres","runtime","imdb","tmdb","trailer","episodes",
+            "detail_url","links","updated_at"
           ];
-
-          const now = new Date().toISOString();
           const valid = items.filter(x => x && x.id);
-
-          if (!valid.length) throw new Error("No records with id");
-
-          let batch = [];
-          let fileNo = 0;
+          const now = new Date().toISOString();
+          let batch = [], part = 0;
 
           function flush() {
             if (!batch.length) return;
-            fileNo++;
             fs.writeFileSync(
-              "/tmp/d1-import/chunk-" +
-                String(fileNo).padStart(4, "0") + ".sql",
+              `/tmp/d1-import/chunk-${String(++part).padStart(4,"0")}.sql`,
               batch.join("\n") + "\n"
             );
             batch = [];
           }
 
-          for (const item of valid) {
-            const detailUrl = item.detail_url ||
-              (item.kind && item.slug
-                ? "https://ctgmovies.com/" + item.kind + "/" + item.slug
-                : null);
-
+          for (const x of valid) {
+            const detail = x.detail_url ||
+              (x.kind && x.slug ? `https://ctgmovies.com/${x.kind}/${x.slug}` : null);
             const values = [
-              item.id, item.kind, item.slug, item.name,
-              item.poster, item.backdrop, item.year, item.overview,
-              item.rating, item.genres, item.runtime, item.imdb,
-              item.tmdb, item.trailer, item.episodes, detailUrl,
-              item.links, now
+              x.id,x.kind,x.slug,x.name,x.poster,x.backdrop,x.year,x.overview,
+              x.rating,x.genres,x.runtime,x.imdb,x.tmdb,x.trailer,x.episodes,
+              detail,x.links,now
             ];
-
             batch.push(
-              "INSERT OR REPLACE INTO movies (" +
-              columns.join(", ") + ") VALUES (" +
-              values.map(val).join(", ") + ");"
+              "INSERT OR REPLACE INTO movies (" + cols.join(",") +
+              ") VALUES (" + values.map(val).join(",") + ");"
             );
-
             if (batch.length >= 100) flush();
           }
-
           flush();
-          console.log("Valid records:", valid.length);
-          console.log("SQL batches:", fileNo);
+          console.log("Records:", valid.length, "SQL batches:", part);
           NODE
 
-      - name: Import catalog into D1
+      - name: Import catalog
         shell: bash
         run: |
           set -euo pipefail
-
           for file in /tmp/d1-import/chunk-*.sql; do
             echo "Importing $file"
-            npx --yes wrangler@4 d1 execute ctgmovies \
-              --remote --file="$file"
+            npx --yes wrangler@4 d1 execute ctgmovies --remote --file="$file"
           done
-
-          echo "Catalog import completed."
 
       - name: Verify imported records
         shell: bash
