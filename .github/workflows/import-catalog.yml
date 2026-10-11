@@ -1,5 +1,5 @@
 ```yaml
-name: Import Catalog to Cloudflare D1
+name: Cloudflare Connection Test
 
 on:
   workflow_dispatch:
@@ -7,10 +7,47 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ctg-d1-import
-  cancel-in-progress: false
-
 jobs:
-  import:
-    runs-on: ubuntu-l
+  test-cloudflare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Test Cloudflare Worker
+        run: |
+          node --input-type=module <<'NODE'
+          const url =
+            "https://ctgmovies-api.proshantobarua70-4a5.workers.dev/movies?skip=0";
+
+          try {
+            const response = await fetch(url, {
+              headers: { Accept: "application/json" },
+              signal: AbortSignal.timeout(20000)
+            });
+
+            console.log("HTTP status:", response.status);
+
+            if (!response.ok) {
+              throw new Error(`Worker returned HTTP ${response.status}`);
+            }
+
+            const data = await response.json();
+            const items = Array.isArray(data)
+              ? data
+              : data?.items;
+
+            if (!Array.isArray(items)) {
+              throw new Error("Unexpected API response format");
+            }
+
+            console.log("Cloudflare connection: OK");
+            console.log("Returned records:", items.length);
+          } catch (error) {
+            console.error("Connection test failed:", error.message);
+            process.exit(1);
+          }
+          NODE
+```
