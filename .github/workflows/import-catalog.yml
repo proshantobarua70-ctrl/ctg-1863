@@ -9,7 +9,7 @@ permissions:
 jobs:
   import:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -25,10 +25,11 @@ jobs:
         with:
           node-version: 20
 
-      - name: Validate catalog
+      - name: Validate catalog and credentials
         shell: bash
         run: |
           set -euo pipefail
+
           test -s data.json.gz
           test -n "$CLOUDFLARE_ACCOUNT_ID"
           test -n "$CLOUDFLARE_API_TOKEN"
@@ -37,10 +38,22 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const zlib = require("zlib");
-          const data = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")).toString("utf8"));
+
+          const raw = zlib.gunzipSync(
+            fs.readFileSync("data.json.gz")
+          ).toString("utf8");
+
+          const data = JSON.parse(raw);
           const items = Array.isArray(data) ? data : data.items;
-          if (!Array.isArray(items) || !items.length) throw new Error("Catalog empty");
-          if (!items.some(x => x && x.id)) throw new Error("No item IDs found");
+
+          if (!Array.isArray(items) || !items.length) {
+            throw new Error("Catalog is empty or invalid");
+          }
+
+          if (!items.some(x => x && x.id)) {
+            throw new Error("No item IDs found");
+          }
+
           console.log("Catalog items:", items.length);
           NODE
 
@@ -58,6 +71,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           npx --yes wrangler@4 d1 execute ctgmovies --remote --command="CREATE TABLE IF NOT EXISTS movies (
             id TEXT PRIMARY KEY,
             kind TEXT,
@@ -79,7 +93,7 @@ jobs:
             updated_at TEXT
           );"
 
-      - name: Prepare SQL batches
+      - name: Prepare small SQL batches
         shell: bash
         run: |
           set -euo pipefail
@@ -88,64 +102,111 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const zlib = require("zlib");
-          const data = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")).toString("utf8"));
+          const path = "/tmp/d1-import";
+
+          const data = JSON.parse(
+            zlib.gunzipSync(fs.readFileSync("data.json.gz")).toString("utf8")
+          );
+
           const items = Array.isArray(data) ? data : data.items;
 
           function val(v) {
             if (v === undefined || v === null || v === "") return "NULL";
-            if (typeof v === "number" && Number.isFinite(v)) return String(v);
+            if (typeof v === "number" && Number.isFinite(v)) {
+              return String(v);
+            }
             if (typeof v === "boolean") return v ? "1" : "0";
-            const s = typeof v === "object" ? JSON.stringify(v) : String(v);
+
+            const s = typeof v === "object"
+              ? JSON.stringify(v)
+              : String(v);
+
             return "'" + s.replace(/'/g, "''") + "'";
           }
 
           const cols = [
-            "id","kind","slug","name","poster","backdrop","year","overview",
-            "rating","genres","runtime","imdb","tmdb","trailer","episodes",
-            "detail_url","links","updated_at"
+            "id", "kind", "slug", "name", "poster", "backdrop",
+            "year", "overview", "rating", "genres", "runtime",
+            "imdb", "tmdb", "trailer", "episodes", "detail_url",
+            "links", "updated_at"
           ];
 
           const valid = items.filter(x => x && x.id);
           const now = new Date().toISOString();
+
+          const MAX_RECORDS = 10;
+          const MAX_SQL_BYTES = 64 * 1024;
+
           let batch = [];
+          let bytes = 0;
           let part = 0;
+          let skipped = 0;
 
           function flush() {
             if (!batch.length) return;
+
             part++;
-            fs.writeFileSync(
-              "/tmp/d1-import/chunk-" + String(part).padStart(4, "0") + ".sql",
-              batch.join("\n") + "\n"
-            );
+
+            const file = path + "/chunk-" +
+              String(part).padStart(5, "0") + ".sql";
+
+            fs.writeFileSync(file, batch.join("\n") + "\n");
             batch = [];
+            bytes = 0;
           }
 
           for (const x of valid) {
             const detail = x.detail_url ||
-              (x.kind && x.slug ? "https://ctgmovies.com/" + x.kind + "/" + x.slug : null);
+              (x.kind && x.slug
+                ? "https://ctgmovies.com/" + x.kind + "/" + x.slug
+                : null);
 
             const values = [
-              x.id,x.kind,x.slug,x.name,x.poster,x.backdrop,x.year,x.overview,
-              x.rating,x.genres,x.runtime,x.imdb,x.tmdb,x.trailer,x.episodes,
-              detail,x.links,now
+              x.id, x.kind, x.slug, x.name, x.poster, x.backdrop,
+              x.year, x.overview, x.rating, x.genres, x.runtime,
+              x.imdb, x.tmdb, x.trailer, x.episodes, detail,
+              x.links, now
             ];
 
-            batch.push(
-              "INSERT OR REPLACE INTO movies (" + cols.join(",") +
-              ") VALUES (" + values.map(val).join(",") + ");"
-            );
+            const sql = "INSERT OR REPLACE INTO movies (" +
+              cols.join(",") + ") VALUES (" +
+              values.map(val).join(",") + ");";
 
-            if (batch.length >= 100) flush();
+            const size = Buffer.byteLength(sql, "utf8") + 1;
+
+            if (size > MAX_SQL_BYTES) {
+              console.error("Skipping oversized record:", String(x.id));
+              skipped++;
+              continue;
+            }
+
+            if (
+              batch.length >= MAX_RECORDS ||
+              bytes + size > MAX_SQL_BYTES
+            ) {
+              flush();
+            }
+
+            batch.push(sql);
+            bytes += size;
           }
 
           flush();
-          console.log("Records:", valid.length, "Batches:", part);
+
+          console.log("Valid records:", valid.length);
+          console.log("SQL batches:", part);
+          console.log("Skipped oversized records:", skipped);
+
+          if (part === 0) {
+            throw new Error("No SQL batches generated");
+          }
           NODE
 
       - name: Import catalog into D1
         shell: bash
         run: |
           set -euo pipefail
+
           for file in /tmp/d1-import/chunk-*.sql; do
             echo "Importing $file"
             npx --yes wrangler@4 d1 execute ctgmovies --remote --file="$file"
@@ -155,4 +216,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           npx --yes wrangler@4 d1 execute ctgmovies --remote --command="SELECT COUNT(*) AS total_records FROM movies;"
+
+          echo "Import workflow completed."
