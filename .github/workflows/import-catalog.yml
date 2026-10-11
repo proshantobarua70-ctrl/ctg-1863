@@ -17,16 +17,13 @@ jobs:
       D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Validate catalog
-        shell: bash
+      - name: Validate
         run: |
           set -euo pipefail
           test -s data.json.gz
@@ -34,142 +31,74 @@ jobs:
           test -n "$CLOUDFLARE_API_TOKEN"
           test -n "$D1_DATABASE_ID"
 
-          node <<'NODE'
-          const fs = require("fs");
-          const zlib = require("zlib");
-          const d = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")));
-          const a = Array.isArray(d) ? d : d.items;
-          if (!Array.isArray(a) || !a.some(x => x && x.id)) throw Error("Invalid catalog");
-          console.log("Records:", a.length);
-          NODE
-
-          cat > wrangler.toml <<EOF
-          name = "ctgmovies-d1-import"
-          compatibility_date = "2026-10-12"
-
-          [[d1_databases]]
-          binding = "DB"
-          database_name = "ctgmovies"
-          database_id = "$D1_DATABASE_ID"
-          EOF
-
       - name: Create table
-        shell: bash
         run: |
-          set -euo pipefail
-          npx --yes wrangler@4 d1 execute ctgmovies --remote --command="CREATE TABLE IF NOT EXISTS movies (id TEXT PRIMARY KEY, kind TEXT, slug TEXT, name TEXT, poster TEXT, backdrop TEXT, year INTEGER, overview TEXT, rating REAL, genres TEXT, runtime INTEGER, imdb TEXT, tmdb TEXT, trailer TEXT, episodes TEXT, detail_url TEXT, links TEXT, updated_at TEXT);"
+          npx --yes wrangler@4 d1 execute ctgmovies --remote \
+          --command="CREATE TABLE IF NOT EXISTS movies (id TEXT PRIMARY KEY, kind TEXT, slug TEXT, name TEXT, poster TEXT, backdrop TEXT, year INTEGER, overview TEXT, rating REAL, genres TEXT, runtime INTEGER, imdb TEXT, tmdb TEXT, trailer TEXT, episodes TEXT, detail_url TEXT, links TEXT, updated_at TEXT);"
 
-      - name: Prepare small SQL files
-        shell: bash
+      - name: Build batches
         run: |
-          set -euo pipefail
-          mkdir -p /tmp/d1-import
-
+          mkdir -p /tmp/sql
           node <<'NODE'
-          const fs = require("fs");
-          const zlib = require("zlib");
-          const d = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")));
+          const fs = require('fs');
+          const zlib = require('zlib');
+          const d = JSON.parse(zlib.gunzipSync(fs.readFileSync('data.json.gz')));
           const items = (Array.isArray(d) ? d : d.items).filter(x => x && x.id);
-
-          const cols = ["id","kind","slug","name","poster","backdrop","year","overview","rating","genres","runtime","imdb","tmdb","trailer","episodes","detail_url","links","updated_at"];
-          const MAX_FILE_BYTES = 70 * 1024;
-          const MAX_FIELD = 6000;
+          const cols = ['id','kind','slug','name','poster','backdrop','year','overview','rating','genres','runtime','imdb','tmdb','trailer','episodes','detail_url','links','updated_at'];
+          const MAX = 500 * 1024, FIELD = 6000;
+          let lines = [], bytes = 0, part = 0;
           const now = new Date().toISOString();
 
-          function raw(v) {
-            if (v == null || v === "") return null;
-            return typeof v === "object" ? JSON.stringify(v) : String(v);
-          }
-
-          function q(s) {
-            return "'" + s.replace(/'/g, "''") + "'";
-          }
-
-          function val(v) {
-            if (v == null || v === "") return "NULL";
-            if (typeof v === "number" && Number.isFinite(v)) return String(v);
-            if (typeof v === "boolean") return v ? "1" : "0";
+          const raw = v => v == null || v === '' ? null :
+            (typeof v === 'object' ? JSON.stringify(v) : String(v));
+          const q = s => "'" + s.replace(/'/g, "''") + "'";
+          const val = v => {
+            if (v == null || v === '') return 'NULL';
+            if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+            if (typeof v === 'boolean') return v ? '1' : '0';
             return q(raw(v));
-          }
-
-          let lines = [], bytes = 0, part = 0, records = 0, chunks = 0;
-
+          };
           function flush() {
             if (!lines.length) return;
-            const name = "/tmp/d1-import/chunk-" + String(++part).padStart(5, "0") + ".sql";
-            fs.writeFileSync(name, lines.join("\n") + "\n");
-            lines = [];
-            bytes = 0;
+            fs.writeFileSync('/tmp/sql/batch-' + String(++part).padStart(5,'0') + '.sql', lines.join('\n') + '\n');
+            lines = []; bytes = 0;
           }
-
-          function add(sql) {
-            const n = Buffer.byteLength(sql, "utf8") + 1;
-            if (n > MAX_FILE_BYTES) throw Error("Single SQL line too large: " + n);
-            if (bytes + n > MAX_FILE_BYTES) flush();
-            lines.push(sql);
-            bytes += n;
+          function add(s) {
+            const n = Buffer.byteLength(s) + 1;
+            if (n > MAX) throw Error('SQL statement exceeds batch limit: ' + n);
+            if (bytes + n > MAX) flush();
+            lines.push(s); bytes += n;
           }
 
           for (const x of items) {
-            const detail = x.detail_url ||
-              (x.kind && x.slug ? "https://ctgmovies.com/" + x.kind + "/" + x.slug : null);
-
-            const values = [
-              x.id,x.kind,x.slug,x.name,x.poster,x.backdrop,x.year,x.overview,
-              x.rating,x.genres,x.runtime,x.imdb,x.tmdb,x.trailer,x.episodes,
-              detail,x.links,now
-            ];
-
-            const stored = [];
-            const updates = [];
-
+            const detail = x.detail_url || (x.kind && x.slug ? 'https://ctgmovies.com/' + x.kind + '/' + x.slug : null);
+            const vals = [x.id,x.kind,x.slug,x.name,x.poster,x.backdrop,x.year,x.overview,x.rating,x.genres,x.runtime,x.imdb,x.tmdb,x.trailer,x.episodes,detail,x.links,now];
+            const stored = [], updates = [];
             for (let i = 0; i < cols.length; i++) {
-              const v = values[i], s = raw(v);
-
-              if (s !== null &&
-                  typeof v !== "number" &&
-                  typeof v !== "boolean" &&
-                  s.length > MAX_FIELD) {
-                stored.push("NULL");
-                chunks++;
-
-                for (let p = 0; p < s.length; p += MAX_FIELD) {
-                  updates.push(
-                    "UPDATE movies SET " + cols[i] +
-                    " = COALESCE(" + cols[i] + ",'') || " +
-                    q(s.slice(p, p + MAX_FIELD)) +
-                    " WHERE id = " + val(x.id) + ";"
-                  );
+              const v = vals[i], s = raw(v);
+              if (s !== null && typeof v !== 'number' && typeof v !== 'boolean' && s.length > FIELD) {
+                stored.push('NULL');
+                for (let p = 0; p < s.length; p += FIELD) {
+                  updates.push('UPDATE movies SET ' + cols[i] + " = COALESCE(" + cols[i] + ",'') || " + q(s.slice(p,p+FIELD)) + ' WHERE id = ' + val(x.id) + ';');
                 }
-              } else {
-                stored.push(val(v));
-              }
+              } else stored.push(val(v));
             }
-
-            add("INSERT OR REPLACE INTO movies (" + cols.join(",") +
-                ") VALUES (" + stored.join(",") + ");");
-
-            for (const sql of updates) add(sql);
-            records++;
+            add('INSERT OR REPLACE INTO movies (' + cols.join(',') + ') VALUES (' + stored.join(',') + ');');
+            for (const u of updates) add(u);
           }
-
           flush();
-          console.log("Records:", records);
-          console.log("SQL files:", part);
-          console.log("Large fields split:", chunks);
+          console.log('Records:', items.length, 'SQL batches:', part);
           NODE
 
-      - name: Import catalog
-        shell: bash
+      - name: Import batches
         run: |
           set -euo pipefail
-          for file in /tmp/d1-import/chunk-*.sql; do
+          for file in /tmp/sql/batch-*.sql; do
             echo "Importing $file"
             npx --yes wrangler@4 d1 execute ctgmovies --remote --file="$file"
           done
 
       - name: Verify
-        shell: bash
         run: |
-          set -euo pipefail
-          npx --yes wrangler@4 d1 execute ctgmovies --remote --command="SELECT COUNT(*) AS total_records FROM movies;"
+          npx --yes wrangler@4 d1 execute ctgmovies --remote \
+          --command="SELECT COUNT(*) AS total_records FROM movies;"
