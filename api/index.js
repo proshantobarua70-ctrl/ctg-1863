@@ -1,16 +1,15 @@
-```js
 const WORKER = "https://ctgmovies-api.proshantobarua70-4a5.workers.dev";
 const PAGE_SIZE = 100;
 const MAX_PAGES = 15;
 const CACHE_MS = 60000;
-const TIMEOUT_MS = 10000;
+const TIMEOUT_MS = 8000;
 const cache = new Map();
 
 function parseJSON(value, fallback = []) {
-  if (Array.isArray(value) || (value && typeof value === "object")) {
-    return value;
-  }
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") return value;
   if (typeof value !== "string" || !value.trim()) return fallback;
+
   try {
     return JSON.parse(value);
   } catch {
@@ -20,7 +19,7 @@ function parseJSON(value, fallback = []) {
 
 function normalize(raw = {}) {
   const item = { ...raw };
-  item.id = item.id == null ? "" : String(item.id);
+  item.id = String(item.id || "");
   item.name = item.name || item.title || "Unknown";
   item.kind = String(item.kind || item.type || "movie").toLowerCase();
   item.episodes = parseJSON(item.episodes, []);
@@ -31,40 +30,30 @@ function normalize(raw = {}) {
 
 async function getJSON(path) {
   const cached = cache.get(path);
+
   if (cached && Date.now() - cached.time < CACHE_MS) {
     return cached.data;
   }
 
-  let lastError;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const response = await fetch(WORKER + path, {
+      headers: { Accept: "application/json" },
+      signal: controller.signal
+    });
 
-    try {
-      const response = await fetch(WORKER + path, {
-        headers: { Accept: "application/json" },
-        signal: controller.signal
-      });
-
-      if (!response.ok) {
-        throw new Error("Worker HTTP " + response.status);
-      }
-
-      const data = await response.json();
-      cache.set(path, { data, time: Date.now() });
-      return data;
-    } catch (error) {
-      lastError = error;
-      if (attempt === 0) {
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
-    } finally {
-      clearTimeout(timer);
+    if (!response.ok) {
+      throw new Error("Worker HTTP " + response.status);
     }
-  }
 
-  throw lastError || new Error("Worker request failed");
+    const data = await response.json();
+    cache.set(path, { data, time: Date.now() });
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function workerPage(page) {
@@ -73,7 +62,7 @@ async function workerPage(page) {
   );
 
   if (!data || !Array.isArray(data.items)) {
-    throw new Error("Invalid Worker movies response");
+    throw new Error("Invalid Worker response");
   }
 
   return data.items.map(normalize);
@@ -91,6 +80,7 @@ function matchesCatalog(item, type, catalogId) {
   if (catalogId === "ctg_anime") return isAnime(item);
   if (catalogId === "ctg_tv") return isSeries(item) && !isAnime(item);
   if (catalogId === "ctg_movies") return !isSeries(item);
+
   return type === "series" ? isSeries(item) : !isSeries(item);
 }
 
@@ -133,7 +123,8 @@ function streamList(links) {
     .filter(link => link && (link.url || link.streamUrl))
     .map(link => ({
       name: link.source || link.quality || "CTGMovies",
-      title: [link.quality, link.source].filter(Boolean).join(" • ") || "Play",
+      title:
+        [link.quality, link.source].filter(Boolean).join(" • ") || "Play",
       url: link.url || link.streamUrl,
       subtitles: parseJSON(link.subs, [])
         .filter(sub => sub && sub.url)
@@ -149,7 +140,8 @@ function sendJSON(res, body, status = 200) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Cache-Control", "public, max-age=30");
+  res.setHeader("Cache-Control", "no-store");
+
   return res.end(JSON.stringify(body));
 }
 
@@ -167,7 +159,11 @@ module.exports = async function handler(req, res) {
     return sendJSON(res, { error: "Method not allowed" }, 405);
   }
 
-  const url = new URL(req.url, "https://ctgmovies-stremio-100.vercel.app");
+  const url = new URL(
+    req.url,
+    "https://ctgmovies-stremio-100.vercel.app"
+  );
+
   const pathname = url.pathname;
 
   try {
@@ -212,11 +208,11 @@ module.exports = async function handler(req, res) {
       const catalogId = catalogMatch[2];
       const rawSkip = Number(url.searchParams.get("skip") || 0);
       const skip = Number.isFinite(rawSkip) ? Math.max(0, rawSkip) : 0;
-      const wanted = skip + PAGE_SIZE;
+
       const found = [];
       const seen = new Set();
 
-      for (let page = 1; page <= MAX_PAGES && found.length < wanted; page++) {
+      for (let page = 1; page <= MAX_PAGES; page++) {
         const items = await workerPage(page);
 
         if (!items.length) break;
@@ -230,15 +226,21 @@ module.exports = async function handler(req, res) {
         }
 
         if (items.length < PAGE_SIZE) break;
+        if (found.length >= skip + PAGE_SIZE) break;
       }
 
       return sendJSON(res, {
-        metas: found.slice(skip, wanted)
+        metas: found.slice(skip, skip + PAGE_SIZE)
       });
     }
 
-    const metaMatch = pathname.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
-    const streamMatch = pathname.match(/^\/stream\/(movie|series)\/(.+)\.json$/);
+    const metaMatch = pathname.match(
+      /^\/meta\/(movie|series)\/(.+)\.json$/
+    );
+
+    const streamMatch = pathname.match(
+      /^\/stream\/(movie|series)\/(.+)\.json$/
+    );
 
     if (metaMatch || streamMatch) {
       const match = metaMatch || streamMatch;
@@ -255,6 +257,7 @@ module.exports = async function handler(req, res) {
         : requestedId;
 
       const endpoint = metaMatch ? "meta" : "stream";
+
       const data = await getJSON(
         "/" + endpoint + "?id=" + encodeURIComponent(baseId)
       );
@@ -287,7 +290,9 @@ module.exports = async function handler(req, res) {
 
         links = selected ? parseJSON(selected.links, []) : [];
       } else if (rawItem.episodes.length && !links.length) {
-        links = rawItem.episodes.flatMap(ep => parseJSON(ep.links, []));
+        links = rawItem.episodes.flatMap(ep =>
+          parseJSON(ep.links, [])
+        );
       }
 
       return sendJSON(res, {
@@ -297,10 +302,11 @@ module.exports = async function handler(req, res) {
 
     return sendJSON(res, { error: "Not found", path: pathname }, 404);
   } catch (error) {
+    console.error("CTGMovies API error:", error);
+
     return sendJSON(res, {
       error: "CTGMovies API failed",
       message: error && error.message ? error.message : "Unknown error"
     }, 503);
   }
 };
-```
