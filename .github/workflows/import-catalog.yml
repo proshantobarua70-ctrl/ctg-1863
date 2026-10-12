@@ -22,15 +22,15 @@ jobs:
       D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Import catalog
+      - name: Import all catalog records
         shell: bash
         run: |
           node <<'NODE'
@@ -42,13 +42,11 @@ jobs:
           const DATABASE = process.env.D1_DATABASE_ID;
 
           if (!TOKEN || !ACCOUNT || !DATABASE) {
-            throw new Error(
-              "Missing secret: check CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID and D1_DATABASE_ID."
-            );
+            throw new Error("Cloudflare secrets are missing.");
           }
 
           if (!fs.existsSync("data.json.gz")) {
-            throw new Error("data.json.gz not found in repository.");
+            throw new Error("data.json.gz is missing.");
           }
 
           const parsed = JSON.parse(
@@ -59,7 +57,7 @@ jobs:
             ?.filter(x => x && x.id != null);
 
           if (!items?.length) {
-            throw new Error("No catalog items with IDs found.");
+            throw new Error("No catalog records found.");
           }
 
           const columns = [
@@ -68,38 +66,43 @@ jobs:
             "imdb", "tmdb", "trailer", "episodes", "detail_url", "links"
           ];
 
-          function sqlValue(v) {
-            if (v === undefined || v === null) return "NULL";
-            if (typeof v === "boolean") return v ? "1" : "0";
-            if (typeof v === "number") {
-              return Number.isFinite(v) ? String(v) : "NULL";
+          function value(v) {
+            if (v === undefined || v === null) return null;
+            if (typeof v === "object") return JSON.stringify(v);
+            if (typeof v === "boolean") return v ? 1 : 0;
+            return v;
+          }
+
+          function makeBatch(rows) {
+            const oneRow = "(" +
+              columns.map(() => "?").join(",") +
+              ",CURRENT_TIMESTAMP)";
+
+            const sql = `
+              INSERT INTO movies (
+                ${columns.map(c => `"${c}"`).join(",")}, "updated_at"
+              )
+              VALUES ${rows.map(() => oneRow).join(",")}
+              ON CONFLICT(id) DO UPDATE SET
+                ${columns.filter(c => c !== "id")
+                  .map(c => `"${c}"=excluded."${c}"`).join(",")},
+                "updated_at"=CURRENT_TIMESTAMP
+            `;
+
+            const params = [];
+            for (const item of rows) {
+              for (const col of columns) params.push(value(item[col]));
             }
-            const s = typeof v === "string" ? v : JSON.stringify(v);
-            return "'" + s.replace(/'/g, "''") + "'";
+
+            return { sql, params };
           }
 
-          function makeSQL(batch) {
-            const cols = [...columns, "updated_at"];
-            const values = batch.map(item => {
-              const vals = columns.map(c => sqlValue(item[c]));
-              vals.push("CURRENT_TIMESTAMP");
-              return "(" + vals.join(",") + ")";
-            });
-
-            const updates = columns
-              .filter(c => c !== "id")
-              .map(c => `"${c}"=excluded."${c}"`);
-            updates.push('"updated_at"=CURRENT_TIMESTAMP');
-
-            return `INSERT INTO movies (${cols.map(c => `"${c}"`).join(",")})
-          VALUES ${values.join(",")}
-          ON CONFLICT(id) DO UPDATE SET ${updates.join(",")}`;
-          }
-
-          async function query(sql) {
+          async function query(statement) {
             const url =
               `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}` +
               `/d1/database/${DATABASE}/query`;
+
+            let lastError;
 
             for (let attempt = 1; attempt <= 5; attempt++) {
               try {
@@ -109,58 +112,77 @@ jobs:
                     Authorization: `Bearer ${TOKEN}`,
                     "Content-Type": "application/json"
                   },
-                  body: JSON.stringify({ sql })
+                  body: JSON.stringify(statement)
                 });
 
                 const body = await res.json();
 
                 if (!res.ok || body.success !== true) {
                   throw new Error(
-                    `HTTP ${res.status}: ${JSON.stringify(body.errors || body).slice(0, 700)}`
+                    `HTTP ${res.status}: ` +
+                    JSON.stringify(body.errors || body).slice(0, 1000)
                   );
                 }
 
                 return body;
               } catch (e) {
-                if (attempt === 5) throw e;
-                console.log(`Retry ${attempt}/5: ${e.message}`);
-                await new Promise(r => setTimeout(r, attempt * 1500));
+                lastError = e;
+
+                if (attempt < 5) {
+                  const delay = Math.min(1000 * 2 ** (attempt - 1), 10000);
+                  console.log(`Retry ${attempt}/5: ${e.message}`);
+                  await new Promise(r => setTimeout(r, delay));
+                }
               }
             }
+
+            throw lastError;
           }
 
           async function main() {
             console.log(`SOURCE ITEMS: ${items.length}`);
 
+            // Keep under SQLite's usual 100 bound-parameter limit.
+            const MAX_ROWS = 5;
+            const MAX_BYTES = 700000;
             const batches = [];
-            let batch = [];
+            let current = [];
 
             for (const item of items) {
-              batch.push(item);
+              const candidate = [...current, item];
+              const request = makeBatch(candidate);
+              const bytes = Buffer.byteLength(
+                JSON.stringify(request), "utf8"
+              );
 
               if (
-                batch.length >= 20 ||
-                Buffer.byteLength(makeSQL(batch), "utf8") > 150000
+                current.length > 0 &&
+                (candidate.length > MAX_ROWS || bytes > MAX_BYTES)
               ) {
-                if (batch.length > 1 &&
-                    Buffer.byteLength(makeSQL(batch), "utf8") > 150000) {
-                  const last = batch.pop();
-                  batches.push(batch);
-                  batch = [last];
-                } else {
-                  batches.push(batch);
-                  batch = [];
-                }
+                batches.push(current);
+                current = [item];
+              } else {
+                current = candidate;
               }
 
-              if (Buffer.byteLength(makeSQL(batch), "utf8") > 150000) {
-                throw new Error(`Single item too large: ${item.id}`);
+              // A large record is kept intact as a single-row request.
+              if (current.length === 1) {
+                const size = Buffer.byteLength(
+                  JSON.stringify(makeBatch(current)), "utf8"
+                );
+                if (size > MAX_BYTES) {
+                  console.log(
+                    `LARGE ITEM: ${item.id} (${size} request bytes); ` +
+                    "sending separately without truncating fields."
+                  );
+                }
               }
             }
 
-            if (batch.length) batches.push(batch);
+            if (current.length) batches.push(current);
 
             console.log(`TOTAL BATCHES: ${batches.length}`);
+            console.log("Starting import...");
 
             let next = 0;
             let completed = 0;
@@ -171,17 +193,20 @@ jobs:
                 const index = next++;
                 if (index >= batches.length) return;
 
+                const rows = batches[index];
+
                 try {
-                  await query(makeSQL(batches[index]));
-                  completed += batches[index].length;
+                  await query(makeBatch(rows));
+                  completed += rows.length;
 
                   console.log(
                     `PROGRESS: ${completed}/${items.length} | ` +
-                    `REMAINING: ${items.length - completed}`
+                    `REMAINING: ${items.length - completed} | ` +
+                    `BATCH: ${index + 1}/${batches.length}`
                   );
                 } catch (e) {
                   failed = new Error(
-                    `Batch ${index + 1} failed: ${e.message}`
+                    `Batch ${index + 1}/${batches.length} failed: ${e.message}`
                   );
                   throw failed;
                 }
@@ -189,20 +214,22 @@ jobs:
             }
 
             const results = await Promise.allSettled(
-              Array.from({ length: 3 }, () => worker())
+              Array.from({ length: 4 }, () => worker())
             );
 
-            const rejected = results.find(x => x.status === "rejected");
+            const rejected = results.find(r => r.status === "rejected");
             if (rejected) throw rejected.reason;
 
-            const result = await query(
-              "SELECT COUNT(*) AS count FROM movies"
-            );
+            const check = await query({
+              sql: "SELECT COUNT(*) AS count FROM movies",
+              params: []
+            });
 
             console.log(
               "D1 UNIQUE ROW COUNT:",
-              result.result?.[0]?.results?.[0]?.count
+              check.result?.[0]?.results?.[0]?.count
             );
+            console.log(`SOURCE ITEMS IMPORTED: ${completed}`);
             console.log("IMPORT COMPLETE");
           }
 
