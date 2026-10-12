@@ -30,7 +30,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Import all catalog records
+      - name: Import catalog
         shell: bash
         run: |
           node <<'NODE'
@@ -42,11 +42,11 @@ jobs:
           const DATABASE = process.env.D1_DATABASE_ID;
 
           if (!TOKEN || !ACCOUNT || !DATABASE) {
-            throw new Error("Cloudflare secrets are missing.");
+            throw new Error("Cloudflare secrets missing.");
           }
 
           if (!fs.existsSync("data.json.gz")) {
-            throw new Error("data.json.gz is missing.");
+            throw new Error("data.json.gz not found.");
           }
 
           const parsed = JSON.parse(
@@ -57,7 +57,7 @@ jobs:
             ?.filter(x => x && x.id != null);
 
           if (!items?.length) {
-            throw new Error("No catalog records found.");
+            throw new Error("No catalog items found.");
           }
 
           const columns = [
@@ -66,32 +66,31 @@ jobs:
             "imdb", "tmdb", "trailer", "episodes", "detail_url", "links"
           ];
 
-          function value(v) {
-            if (v === undefined || v === null) return null;
+          function val(v) {
+            if (v == null) return null;
             if (typeof v === "object") return JSON.stringify(v);
             if (typeof v === "boolean") return v ? 1 : 0;
             return v;
           }
 
-          function makeBatch(rows) {
-            const oneRow = "(" +
+          function makeQuery(rows) {
+            const insertCols = [...columns, "updated_at"];
+            const placeholders = "(" +
               columns.map(() => "?").join(",") +
               ",CURRENT_TIMESTAMP)";
 
             const sql = `
-              INSERT INTO movies (
-                ${columns.map(c => `"${c}"`).join(",")}, "updated_at"
-              )
-              VALUES ${rows.map(() => oneRow).join(",")}
+              INSERT INTO movies (${insertCols.map(c => `"${c}"`).join(",")})
+              VALUES ${rows.map(() => placeholders).join(",")}
               ON CONFLICT(id) DO UPDATE SET
-                ${columns.filter(c => c !== "id")
-                  .map(c => `"${c}"=excluded."${c}"`).join(",")},
-                "updated_at"=CURRENT_TIMESTAMP
+              ${columns.filter(c => c !== "id")
+                .map(c => `"${c}"=excluded."${c}"`).join(",")},
+              "updated_at"=CURRENT_TIMESTAMP
             `;
 
             const params = [];
             for (const item of rows) {
-              for (const col of columns) params.push(value(item[col]));
+              for (const col of columns) params.push(val(item[col]));
             }
 
             return { sql, params };
@@ -106,7 +105,7 @@ jobs:
 
             for (let attempt = 1; attempt <= 5; attempt++) {
               try {
-                const res = await fetch(url, {
+                const response = await fetch(url, {
                   method: "POST",
                   headers: {
                     Authorization: `Bearer ${TOKEN}`,
@@ -115,24 +114,23 @@ jobs:
                   body: JSON.stringify(statement)
                 });
 
-                const body = await res.json();
+                const body = await response.json();
 
-                if (!res.ok || body.success !== true) {
+                if (!response.ok || body.success !== true) {
                   throw new Error(
-                    `HTTP ${res.status}: ` +
-                    JSON.stringify(body.errors || body).slice(0, 1000)
+                    `HTTP ${response.status}: ` +
+                    JSON.stringify(body.errors || body).slice(0, 900)
                   );
                 }
 
                 return body;
-              } catch (e) {
-                lastError = e;
+              } catch (error) {
+                lastError = error;
+                if (attempt === 5) break;
 
-                if (attempt < 5) {
-                  const delay = Math.min(1000 * 2 ** (attempt - 1), 10000);
-                  console.log(`Retry ${attempt}/5: ${e.message}`);
-                  await new Promise(r => setTimeout(r, delay));
-                }
+                const delay = Math.min(1000 * 2 ** (attempt - 1), 10000);
+                console.log(`Retry ${attempt}/5: ${error.message}`);
+                await new Promise(resolve => setTimeout(resolve, delay));
               }
             }
 
@@ -142,22 +140,20 @@ jobs:
           async function main() {
             console.log(`SOURCE ITEMS: ${items.length}`);
 
-            // Keep under SQLite's usual 100 bound-parameter limit.
-            const MAX_ROWS = 5;
+            const MAX_ROWS = 50;
             const MAX_BYTES = 700000;
             const batches = [];
             let current = [];
 
             for (const item of items) {
               const candidate = [...current, item];
-              const request = makeBatch(candidate);
-              const bytes = Buffer.byteLength(
-                JSON.stringify(request), "utf8"
+              const size = Buffer.byteLength(
+                JSON.stringify(makeQuery(candidate)), "utf8"
               );
 
               if (
-                current.length > 0 &&
-                (candidate.length > MAX_ROWS || bytes > MAX_BYTES)
+                current.length &&
+                (candidate.length > MAX_ROWS || size > MAX_BYTES)
               ) {
                 batches.push(current);
                 current = [item];
@@ -165,56 +161,52 @@ jobs:
                 current = candidate;
               }
 
-              // A large record is kept intact as a single-row request.
-              if (current.length === 1) {
-                const size = Buffer.byteLength(
-                  JSON.stringify(makeBatch(current)), "utf8"
+              const singleSize = Buffer.byteLength(
+                JSON.stringify(makeQuery(current)), "utf8"
+              );
+
+              if (current.length === 1 && singleSize > MAX_BYTES) {
+                console.log(
+                  `LARGE RECORD: ${item.id}, ${singleSize} bytes; ` +
+                  "sending intact as a single-record request."
                 );
-                if (size > MAX_BYTES) {
-                  console.log(
-                    `LARGE ITEM: ${item.id} (${size} request bytes); ` +
-                    "sending separately without truncating fields."
-                  );
-                }
               }
             }
 
             if (current.length) batches.push(current);
 
             console.log(`TOTAL BATCHES: ${batches.length}`);
-            console.log("Starting import...");
+            console.log("PARALLEL WORKERS: 6");
 
             let next = 0;
             let completed = 0;
-            let failed = null;
+            let failure = null;
 
             async function worker() {
-              while (!failed) {
+              while (!failure) {
                 const index = next++;
                 if (index >= batches.length) return;
 
-                const rows = batches[index];
-
                 try {
-                  await query(makeBatch(rows));
-                  completed += rows.length;
+                  await query(makeQuery(batches[index]));
+                  completed += batches[index].length;
 
                   console.log(
                     `PROGRESS: ${completed}/${items.length} | ` +
                     `REMAINING: ${items.length - completed} | ` +
                     `BATCH: ${index + 1}/${batches.length}`
                   );
-                } catch (e) {
-                  failed = new Error(
-                    `Batch ${index + 1}/${batches.length} failed: ${e.message}`
+                } catch (error) {
+                  failure = new Error(
+                    `Batch ${index + 1} failed: ${error.message}`
                   );
-                  throw failed;
+                  throw failure;
                 }
               }
             }
 
             const results = await Promise.allSettled(
-              Array.from({ length: 4 }, () => worker())
+              Array.from({ length: 6 }, () => worker())
             );
 
             const rejected = results.find(r => r.status === "rejected");
@@ -229,12 +221,12 @@ jobs:
               "D1 UNIQUE ROW COUNT:",
               check.result?.[0]?.results?.[0]?.count
             );
-            console.log(`SOURCE ITEMS IMPORTED: ${completed}`);
+            console.log(`SOURCE ITEMS PROCESSED: ${completed}`);
             console.log("IMPORT COMPLETE");
           }
 
-          main().catch(e => {
-            console.error("IMPORT FAILED:", e.stack || e.message);
+          main().catch(error => {
+            console.error("IMPORT FAILED:", error.stack || error.message);
             process.exit(1);
           });
           NODE
