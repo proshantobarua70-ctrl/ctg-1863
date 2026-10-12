@@ -6,51 +6,140 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ctgmovies-d1-import
-  cancel-in-progress: false
-
 jobs:
   import:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Check catalog file
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s data.json.gz
-          SIZE=$(stat -c%s data.json.gz)
-          echo "Catalog file size: $SIZE bytes"
-          test "$SIZE" -ge 100
-
-      - name: Check import script
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s import-to-d1.js || {
-            echo "::error::import-to-d1.js not found in repository root"
-            exit 1
-          }
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Import catalog to Cloudflare D1
+      - name: Fast parallel catalog import
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$CLOUDFLARE_API_TOKEN"
-          test -n "$CLOUDFLARE_ACCOUNT_ID"
-          test -n "$CLOUDFLARE_D1_DATABASE_ID"
-          node import-to-d1.js
+          node <<'NODE'
+          const fs = require("fs");
+          const zlib = require("zlib");
+
+          async function main() {
+            const { CF_API_TOKEN: token, CF_ACCOUNT_ID: account, CF_DATABASE_ID: database } = process.env;
+            if (!token || !account || !database) throw Error("Cloudflare secrets missing");
+
+            const data = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")));
+            const items = (Array.isArray(data) ? data : data.items || []).filter(x => x && x.id);
+            const total = items.length;
+            if (!total) throw Error("Catalog is empty");
+
+            console.log(`SOURCE TOTAL: ${total}`);
+
+            const endpoint = `https://api.cloudflare.com/client/v4/accounts/${account}/d1/database/${database}/query`;
+            const BATCH_SIZE = 100;
+            const PARALLEL = 4;
+            const MAX_RETRIES = 4;
+            let next = 0, completed = 0, failed = false;
+
+            function value(v) {
+              if (v == null || v === "") return null;
+              if (typeof v === "object") return JSON.stringify(v);
+              return v;
+            }
+
+            const sql = `INSERT INTO movies (
+              id,kind,slug,name,poster,backdrop,year,overview,rating,
+              genres,runtime,imdb,tmdb,trailer,episodes,detail_url,links
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+              kind=excluded.kind, slug=excluded.slug, name=excluded.name,
+              poster=excluded.poster, backdrop=excluded.backdrop,
+              year=excluded.year, overview=excluded.overview,
+              rating=excluded.rating, genres=excluded.genres,
+              runtime=excluded.runtime, imdb=excluded.imdb,
+              tmdb=excluded.tmdb, trailer=excluded.trailer,
+              episodes=excluded.episodes, detail_url=excluded.detail_url,
+              links=excluded.links, updated_at=CURRENT_TIMESTAMP`;
+
+            async function query(batch) {
+              let lastError;
+              for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                try {
+                  const response = await fetch(endpoint, {
+                    method: "POST",
+                    headers: {
+                      Authorization: `Bearer ${token}`,
+                      "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ batch })
+                  });
+                  const text = await response.text();
+                  let result;
+                  try { result = JSON.parse(text); } catch { throw Error(`HTTP ${response.status}: ${text.slice(0,500)}`); }
+                  if (!response.ok || !result.success) {
+                    throw Error(`HTTP ${response.status}: ${JSON.stringify(result.errors || result).slice(0,1000)}`);
+                  }
+                  if ((result.result || []).some(r => r.success === false)) {
+                    throw Error(JSON.stringify(result.result));
+                  }
+                  return result;
+                } catch (e) {
+                  lastError = e;
+                  if (attempt < MAX_RETRIES) {
+                    console.log(`Retry ${attempt}/${MAX_RETRIES - 1}: ${e.message}`);
+                    await new Promise(r => setTimeout(r, attempt * 1000));
+                  }
+                }
+              }
+              throw lastError;
+            }
+
+            async function worker() {
+              while (true) {
+                const start = next;
+                next += BATCH_SIZE;
+                if (start >= total) return;
+
+                const chunk = items.slice(start, start + BATCH_SIZE);
+                const batch = chunk.map(item => ({
+                  sql,
+                  params: [
+                    value(item.id), value(item.kind), value(item.slug),
+                    value(item.name), value(item.poster), value(item.backdrop),
+                    value(item.year), value(item.overview), value(item.rating),
+                    value(item.genres), value(item.runtime), value(item.imdb),
+                    value(item.tmdb), value(item.trailer), value(item.episodes),
+                    value(item.detail_url || (item.kind && item.slug ? `https://ctgmovies.com/${item.kind}/${item.slug}` : null)),
+                    value(item.links)
+                  ]
+                }));
+
+                await query(batch);
+                completed += chunk.length;
+                console.log(`PROGRESS: ${completed}/${total} submitted | ${Math.max(0,total-completed)} remaining`);
+              }
+            }
+
+            const workers = Array.from({length: PARALLEL}, () => worker());
+            const results = await Promise.allSettled(workers);
+            const rejected = results.find(r => r.status === "rejected");
+            if (rejected) throw rejected.reason;
+
+            const check = await query([{sql:"SELECT COUNT(*) AS count FROM movies",params:[]}]);
+            console.log("D1 UNIQUE ROW COUNT:", check.result?.[0]?.results?.[0]?.count);
+            console.log("IMPORT COMPLETE");
+          }
+
+          main().catch(e => {
+            console.error("IMPORT FAILED:", e.message || e);
+            process.exit(1);
+          });
+          NODE
