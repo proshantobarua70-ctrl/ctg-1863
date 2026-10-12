@@ -1,4 +1,3 @@
-```js
 const WORKER = "https://ctgmovies-api.proshantobarua70-4a5.workers.dev";
 const PAGE_SIZE = 100;
 const MAX_PAGES = 15;
@@ -32,44 +31,33 @@ async function getJSON(path) {
   if (cached && Date.now() - cached.time < CACHE_MS) return cached.data;
 
   let lastError;
-
   for (let attempt = 0; attempt < 2; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
     try {
       const response = await fetch(WORKER + path, {
         headers: { Accept: "application/json" },
         signal: controller.signal
       });
-
       if (!response.ok) throw new Error("Worker HTTP " + response.status);
-
       const data = await response.json();
       cache.set(path, { data, time: Date.now() });
       return data;
     } catch (error) {
       lastError = error;
-      if (attempt === 0) {
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
+      if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 300));
     } finally {
       clearTimeout(timer);
     }
   }
-
   throw lastError || new Error("Worker request failed");
 }
 
 async function workerPage(page) {
-  const data = await getJSON(
-    "/movies?page=" + page + "&limit=" + PAGE_SIZE
-  );
-
+  const data = await getJSON("/movies?page=" + page + "&limit=" + PAGE_SIZE);
   if (!data || !Array.isArray(data.items)) {
     throw new Error("Invalid Worker movies response");
   }
-
   return data.items.map(normalize);
 }
 
@@ -91,7 +79,6 @@ function matchesCatalog(item, type, catalogId) {
 function toMeta(raw) {
   const item = normalize(raw);
   const series = isSeries(item);
-
   const meta = {
     id: item.id,
     type: series ? "series" : "movie",
@@ -108,7 +95,6 @@ function toMeta(raw) {
     meta.videos = item.episodes.map((ep, index) => {
       const season = Number(ep.s || 1);
       const episode = Number(ep.e || index + 1);
-
       return {
         id: item.id + ":" + season + ":" + episode,
         title: ep.name || "Episode " + episode,
@@ -118,7 +104,6 @@ function toMeta(raw) {
       };
     });
   }
-
   return meta;
 }
 
@@ -156,7 +141,6 @@ module.exports = async function handler(req, res) {
     res.statusCode = 204;
     return res.end();
   }
-
   if (req.method !== "GET") {
     return sendJSON(res, { error: "Method not allowed" }, 405);
   }
@@ -183,23 +167,18 @@ module.exports = async function handler(req, res) {
     }
 
     if (pathname === "/health") {
-      const data = await getJSON("/ping");
       return sendJSON(res, {
         ok: true,
         service: "CTGMovies Vercel API",
-        worker: data
+        worker: await getJSON("/ping")
       });
     }
 
     if (pathname === "/status") {
-      const data = await getJSON("/db");
-      return sendJSON(res, { ok: true, database: data });
+      return sendJSON(res, { ok: true, database: await getJSON("/db") });
     }
 
-    const catalogMatch = pathname.match(
-      /^\/catalog\/(movie|series)\/([^/]+)\.json$/
-    );
-
+    const catalogMatch = pathname.match(/^\/catalog\/(movie|series)\/([^/]+)\.json$/);
     if (catalogMatch) {
       const type = catalogMatch[1];
       const catalogId = catalogMatch[2];
@@ -212,20 +191,15 @@ module.exports = async function handler(req, res) {
       for (let page = 1; page <= MAX_PAGES && found.length < wanted; page++) {
         const items = await workerPage(page);
         if (!items.length) break;
-
         for (const item of items) {
           if (!item.id || !matchesCatalog(item, type, catalogId)) continue;
           if (seen.has(item.id)) continue;
           seen.add(item.id);
           found.push(toMeta(item));
         }
-
         if (items.length < PAGE_SIZE) break;
       }
-
-      return sendJSON(res, {
-        metas: found.slice(skip, wanted)
-      });
+      return sendJSON(res, { metas: found.slice(skip, wanted) });
     }
 
     const metaMatch = pathname.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
@@ -235,28 +209,20 @@ module.exports = async function handler(req, res) {
       const match = metaMatch || streamMatch;
       const requestedId = decodeURIComponent(match[2]);
       const parts = requestedId.split(":");
-
       const episodeRequest =
         parts.length >= 5 &&
         /^\d+$/.test(parts[parts.length - 2]) &&
         /^\d+$/.test(parts[parts.length - 1]);
 
-      const baseId = episodeRequest
-        ? parts.slice(0, -2).join(":")
-        : requestedId;
-
+      const baseId = episodeRequest ? parts.slice(0, -2).join(":") : requestedId;
       const endpoint = metaMatch ? "meta" : "stream";
-      const data = await getJSON(
-        "/" + endpoint + "?id=" + encodeURIComponent(baseId)
-      );
+      const data = await getJSON("/" + endpoint + "?id=" + encodeURIComponent(baseId));
 
       if (metaMatch) {
         const rawItem = data.meta || data.item || data;
-
         if (!rawItem || !(rawItem.id || rawItem.name || rawItem.title)) {
           return sendJSON(res, { error: "Item not found" }, 404);
         }
-
         return sendJSON(res, { meta: toMeta(rawItem) });
       }
 
@@ -270,12 +236,9 @@ module.exports = async function handler(req, res) {
       if (episodeRequest) {
         const season = Number(parts[parts.length - 2]);
         const episode = Number(parts[parts.length - 1]);
-
         const selected = rawItem.episodes.find(ep =>
-          Number(ep.s || 1) === season &&
-          Number(ep.e || 1) === episode
+          Number(ep.s || 1) === season && Number(ep.e || 1) === episode
         );
-
         links = selected ? parseJSON(selected.links, []) : [];
       } else if (rawItem.episodes.length && !links.length) {
         links = rawItem.episodes.flatMap(ep => parseJSON(ep.links, []));
@@ -292,4 +255,3 @@ module.exports = async function handler(req, res) {
     }, 503);
   }
 };
-```
