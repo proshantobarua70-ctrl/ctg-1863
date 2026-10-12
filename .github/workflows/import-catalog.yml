@@ -19,7 +19,7 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
 
     steps:
       - name: Checkout repository
@@ -30,41 +30,36 @@ jobs:
         with:
           node-version: 20
 
-      - name: Import full catalog into D1
+      - name: Import catalog
         shell: bash
         run: |
-          node --input-type=commonjs <<'NODE'
+          node <<'NODE'
           const fs = require("node:fs");
           const zlib = require("node:zlib");
 
           const TOKEN = process.env.CLOUDFLARE_API_TOKEN;
           const ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID;
-          const DATABASE = process.env.CLOUDFLARE_D1_DATABASE_ID;
+          const DATABASE = process.env.D1_DATABASE_ID;
 
           if (!TOKEN || !ACCOUNT || !DATABASE) {
             throw new Error(
-              "Missing Cloudflare secret. Check the existing secret names."
+              "Missing secret: check CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID and D1_DATABASE_ID."
             );
           }
 
-          const FILE = "data.json.gz";
-
-          if (!fs.existsSync(FILE)) {
-            throw new Error(`${FILE} not found in repository.`);
+          if (!fs.existsSync("data.json.gz")) {
+            throw new Error("data.json.gz not found in repository.");
           }
 
-          const raw = zlib.gunzipSync(fs.readFileSync(FILE)).toString("utf8");
-          const parsed = JSON.parse(raw);
-          const source = Array.isArray(parsed) ? parsed : parsed.items;
+          const parsed = JSON.parse(
+            zlib.gunzipSync(fs.readFileSync("data.json.gz")).toString("utf8")
+          );
 
-          if (!Array.isArray(source) || source.length === 0) {
-            throw new Error("No catalog items found in data.json.gz.");
-          }
+          const items = (Array.isArray(parsed) ? parsed : parsed.items)
+            ?.filter(x => x && x.id != null);
 
-          const items = source.filter(x => x && x.id != null);
-
-          if (!items.length) {
-            throw new Error("No items with IDs found.");
+          if (!items?.length) {
+            throw new Error("No catalog items with IDs found.");
           }
 
           const columns = [
@@ -73,38 +68,30 @@ jobs:
             "imdb", "tmdb", "trailer", "episodes", "detail_url", "links"
           ];
 
-          function literal(value) {
-            if (value === undefined || value === null) return "NULL";
-
-            if (typeof value === "number") {
-              return Number.isFinite(value) ? String(value) : "NULL";
+          function sqlValue(v) {
+            if (v === undefined || v === null) return "NULL";
+            if (typeof v === "boolean") return v ? "1" : "0";
+            if (typeof v === "number") {
+              return Number.isFinite(v) ? String(v) : "NULL";
             }
-
-            if (typeof value === "boolean") return value ? "1" : "0";
-
-            const str = typeof value === "string"
-              ? value
-              : JSON.stringify(value);
-
-            return "'" + str.replace(/'/g, "''") + "'";
+            const s = typeof v === "string" ? v : JSON.stringify(v);
+            return "'" + s.replace(/'/g, "''") + "'";
           }
 
-          function makeStatement(rows) {
-            const values = rows.map(item => {
-              const row = columns.map(col => literal(item[col]));
-              row.push("CURRENT_TIMESTAMP");
-              return "(" + row.join(",") + ")";
+          function makeSQL(batch) {
+            const cols = [...columns, "updated_at"];
+            const values = batch.map(item => {
+              const vals = columns.map(c => sqlValue(item[c]));
+              vals.push("CURRENT_TIMESTAMP");
+              return "(" + vals.join(",") + ")";
             });
 
-            const insertColumns = [...columns, "updated_at"];
-
             const updates = columns
-              .filter(col => col !== "id")
-              .map(col => `"${col}"=excluded."${col}"`);
-
+              .filter(c => c !== "id")
+              .map(c => `"${c}"=excluded."${c}"`);
             updates.push('"updated_at"=CURRENT_TIMESTAMP');
 
-            return `INSERT INTO movies (${insertColumns.map(c => `"${c}"`).join(",")})
+            return `INSERT INTO movies (${cols.map(c => `"${c}"`).join(",")})
           VALUES ${values.join(",")}
           ON CONFLICT(id) DO UPDATE SET ${updates.join(",")}`;
           }
@@ -114,117 +101,87 @@ jobs:
               `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}` +
               `/d1/database/${DATABASE}/query`;
 
-            let lastError;
-
             for (let attempt = 1; attempt <= 5; attempt++) {
               try {
-                const response = await fetch(url, {
+                const res = await fetch(url, {
                   method: "POST",
                   headers: {
-                    "Authorization": `Bearer ${TOKEN}`,
+                    Authorization: `Bearer ${TOKEN}`,
                     "Content-Type": "application/json"
                   },
                   body: JSON.stringify({ sql })
                 });
 
-                const text = await response.text();
-                let data;
+                const body = await res.json();
 
-                try {
-                  data = JSON.parse(text);
-                } catch {
+                if (!res.ok || body.success !== true) {
                   throw new Error(
-                    `Cloudflare returned invalid JSON: ${text.slice(0, 300)}`
+                    `HTTP ${res.status}: ${JSON.stringify(body.errors || body).slice(0, 700)}`
                   );
                 }
 
-                if (!response.ok || data.success !== true) {
-                  throw new Error(
-                    `HTTP ${response.status}: ` +
-                    JSON.stringify(data.errors || data).slice(0, 800)
-                  );
-                }
-
-                return data;
-              } catch (error) {
-                lastError = error;
-
-                if (attempt === 5) break;
-
-                const delay = Math.min(1000 * (2 ** (attempt - 1)), 10000);
-                console.log(
-                  `Retry ${attempt}/5 after error: ${error.message}`
-                );
-                await new Promise(resolve => setTimeout(resolve, delay));
+                return body;
+              } catch (e) {
+                if (attempt === 5) throw e;
+                console.log(`Retry ${attempt}/5: ${e.message}`);
+                await new Promise(r => setTimeout(r, attempt * 1500));
               }
             }
-
-            throw lastError;
           }
 
           async function main() {
-            console.log(`SOURCE ITEMS: ${source.length}`);
-            console.log(`ITEMS WITH IDs: ${items.length}`);
-            console.log("Preparing size-limited SQL batches...");
+            console.log(`SOURCE ITEMS: ${items.length}`);
 
-            const MAX_ROWS = 40;
-            const MAX_SQL_BYTES = 300000;
             const batches = [];
-            let current = [];
+            let batch = [];
 
             for (const item of items) {
-              const candidate = [...current, item];
-              const sql = makeStatement(candidate);
-              const bytes = Buffer.byteLength(sql, "utf8");
+              batch.push(item);
 
               if (
-                current.length > 0 &&
-                (candidate.length > MAX_ROWS || bytes > MAX_SQL_BYTES)
+                batch.length >= 20 ||
+                Buffer.byteLength(makeSQL(batch), "utf8") > 150000
               ) {
-                batches.push(current);
-                current = [item];
-              } else {
-                current = candidate;
+                if (batch.length > 1 &&
+                    Buffer.byteLength(makeSQL(batch), "utf8") > 150000) {
+                  const last = batch.pop();
+                  batches.push(batch);
+                  batch = [last];
+                } else {
+                  batches.push(batch);
+                  batch = [];
+                }
               }
 
-              if (Buffer.byteLength(makeStatement(current), "utf8") > MAX_SQL_BYTES) {
-                throw new Error(
-                  `One item is too large for a safe SQL batch: ${item.id}`
-                );
+              if (Buffer.byteLength(makeSQL(batch), "utf8") > 150000) {
+                throw new Error(`Single item too large: ${item.id}`);
               }
             }
 
-            if (current.length) batches.push(current);
+            if (batch.length) batches.push(batch);
 
-            const total = items.length;
-            const totalBatches = batches.length;
+            console.log(`TOTAL BATCHES: ${batches.length}`);
+
             let next = 0;
             let completed = 0;
             let failed = null;
-
-            console.log(`TOTAL BATCHES: ${totalBatches}`);
-            console.log(`TOTAL ITEMS: ${total}`);
-            console.log("Starting import...");
 
             async function worker() {
               while (!failed) {
                 const index = next++;
                 if (index >= batches.length) return;
 
-                const batch = batches[index];
-
                 try {
-                  await query(makeStatement(batch));
-                  completed += batch.length;
+                  await query(makeSQL(batches[index]));
+                  completed += batches[index].length;
 
                   console.log(
-                    `PROGRESS: ${completed}/${total} | ` +
-                    `remaining: ${total - completed} | ` +
-                    `batch: ${index + 1}/${totalBatches}`
+                    `PROGRESS: ${completed}/${items.length} | ` +
+                    `REMAINING: ${items.length - completed}`
                   );
-                } catch (error) {
+                } catch (e) {
                   failed = new Error(
-                    `Batch ${index + 1}/${totalBatches} failed: ${error.message}`
+                    `Batch ${index + 1} failed: ${e.message}`
                   );
                   throw failed;
                 }
@@ -235,24 +192,22 @@ jobs:
               Array.from({ length: 3 }, () => worker())
             );
 
-            const rejected = results.find(r => r.status === "rejected");
-
+            const rejected = results.find(x => x.status === "rejected");
             if (rejected) throw rejected.reason;
 
-            const verification = await query(
+            const result = await query(
               "SELECT COUNT(*) AS count FROM movies"
             );
 
-            const count = verification.result?.[0]?.results?.[0]?.count;
-
-            console.log(`SOURCE ITEMS: ${total}`);
-            console.log(`ITEMS SUBMITTED SUCCESSFULLY: ${completed}`);
-            console.log(`D1 UNIQUE ROW COUNT: ${count}`);
+            console.log(
+              "D1 UNIQUE ROW COUNT:",
+              result.result?.[0]?.results?.[0]?.count
+            );
             console.log("IMPORT COMPLETE");
           }
 
-          main().catch(error => {
-            console.error("IMPORT FAILED:", error.stack || error.message);
+          main().catch(e => {
+            console.error("IMPORT FAILED:", e.stack || e.message);
             process.exit(1);
           });
           NODE
