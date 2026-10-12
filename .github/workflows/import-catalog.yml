@@ -1,53 +1,167 @@
+name: Import Catalog to Cloudflare D1
 
-      - name: Import lanes in parallel
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ctgmovies-d1-import
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validate catalog
+        id: catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s data.json.gz
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$D1_DATABASE_ID"
+
+          node <<'NODE'
+          const fs = require("fs");
+          const zlib = require("zlib");
+          const d = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")));
+          const items = (Array.isArray(d) ? d : d.items || []).filter(x => x && x.id);
+          if (!items.length) throw new Error("Catalog empty or invalid");
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `total=${items.length}\n`);
+          console.log(`SOURCE TOTAL: ${items.length}`);
+          NODE
+
+      - name: Create table
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4 d1 execute ctgmovies --remote \
+            --command="CREATE TABLE IF NOT EXISTS movies (id TEXT PRIMARY KEY, kind TEXT, slug TEXT, name TEXT, poster TEXT, backdrop TEXT, year INTEGER, overview TEXT, rating REAL, genres TEXT, runtime INTEGER, imdb TEXT, tmdb TEXT, trailer TEXT, episodes TEXT, detail_url TEXT, links TEXT, updated_at TEXT);"
+
+      - name: Build batches
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/d1-import
+
+          node <<'NODE'
+          const fs = require("fs"), zlib = require("zlib"), path = require("path");
+          const d = JSON.parse(zlib.gunzipSync(fs.readFileSync("data.json.gz")));
+          const items = (Array.isArray(d) ? d : d.items || []).filter(x => x && x.id);
+          const cols = ["id","kind","slug","name","poster","backdrop","year","overview","rating","genres","runtime","imdb","tmdb","trailer","episodes","detail_url","links","updated_at"];
+          const root = "/tmp/d1-import", laneCount = 4, maxField = 6000, maxBytes = 70*1024;
+          const now = new Date().toISOString();
+          const q = s => "'" + s.replace(/'/g, "''") + "'";
+          const raw = v => v == null || v === "" ? null : typeof v === "object" ? JSON.stringify(v) : String(v);
+          const val = v => v == null || v === "" ? "NULL" : typeof v === "number" && Number.isFinite(v) ? String(v) : typeof v === "boolean" ? (v ? "1" : "0") : q(raw(v));
+          const lanes = Array.from({length:laneCount},(_,i)=>{
+            const dir=path.join(root,"lane-"+i); fs.mkdirSync(dir,{recursive:true});
+            return {dir,lines:[],bytes:0,part:0};
+          });
+          function flush(l){
+            if(!l.lines.length)return;
+            fs.writeFileSync(path.join(l.dir,"batch-"+String(++l.part).padStart(5,"0")+".sql"),l.lines.join("\n")+"\n");
+            l.lines=[]; l.bytes=0;
+          }
+          function add(l,s){
+            const n=Buffer.byteLength(s)+1;
+            if(n>maxBytes)throw Error("SQL statement exceeds batch limit");
+            if(l.bytes+n>maxBytes)flush(l);
+            l.lines.push(s); l.bytes+=n;
+          }
+          items.forEach((x,i)=>{
+            const l=lanes[i%laneCount];
+            const detail=x.detail_url||(x.kind&&x.slug?"https://ctgmovies.com/"+x.kind+"/"+x.slug:null);
+            const values=[x.id,x.kind,x.slug,x.name,x.poster,x.backdrop,x.year,x.overview,x.rating,x.genres,x.runtime,x.imdb,x.tmdb,x.trailer,x.episodes,detail,x.links,now];
+            const stored=[], updates=[];
+            values.forEach((v,j)=>{
+              const s=raw(v);
+              if(s!==null && typeof v!=="number" && typeof v!=="boolean" && s.length>maxField){
+                stored.push("NULL");
+                for(let p=0;p<s.length;p+=maxField){
+                  updates.push("UPDATE movies SET "+cols[j]+"=COALESCE("+cols[j]+",'')||"+q(s.slice(p,p+maxField))+" WHERE id="+val(x.id)+";");
+                }
+              } else stored.push(val(v));
+            });
+            add(l,"INSERT OR REPLACE INTO movies ("+cols.join(",")+") VALUES ("+stored.join(",")+");");
+            updates.forEach(s=>add(l,s));
+          });
+          lanes.forEach(flush);
+          console.log("Source records: "+items.length);
+          console.log("SQL batches: "+lanes.reduce((n,l)=>n+l.part,0));
+          NODE
+
+      - name: Import with progress and retry
         shell: bash
         env:
           TOTAL: ${{ steps.catalog.outputs.total }}
         run: |
           set -euo pipefail
-
           ROOT=/tmp/d1-import
-          TOTAL_BATCHES=$(find "$ROOT" -type f -name 'batch-*.sql' | wc -l)
-          echo "Total catalog records: ${TOTAL:-unknown}"
-          echo "Total SQL batches: $TOTAL_BATCHES"
+          DONE="$RUNNER_TEMP/d1-progress"
+          LOCK="$RUNNER_TEMP/d1-progress-lock"
+          : > "$DONE"
+          BATCHES=$(find "$ROOT" -type f -name 'batch-*.sql' | wc -l)
+          export TOTAL DONE LOCK BATCHES
 
-          export TOTAL_BATCHES
-          export TOTAL
-          export DONE_FILE="$RUNNER_TEMP/import-done"
-          touch "$DONE_FILE"
-          export PROGRESS_LOCK="$RUNNER_TEMP/progress-lock"
+          echo "SOURCE TOTAL: $TOTAL"
+          echo "BATCH TOTAL: $BATCHES"
 
           run_lane() {
-            local lane="$1"
-            local file attempt
+            local lane="$1" file attempt records
             for file in "$lane"/batch-*.sql; do
               [ -f "$file" ] || continue
               attempt=1
-              until npx --yes wrangler@4 d1 execute ctgmovies \
-                --remote --file="$file" >"$RUNNER_TEMP/wrangler.log" 2>&1; do
-                cat "$RUNNER_TEMP/wrangler.log"
-                if [ "$attempt" -ge 4 ]; then
-                  echo "::error::Failed after 4 attempts: $(basename "$file")"
+              while ! npx --yes wrangler@4 d1 execute ctgmovies --remote --file="$file" >"$RUNNER_TEMP/d1-wrangler.log" 2>&1; do
+                cat "$RUNNER_TEMP/d1-wrangler.log"
+                if [ "$attempt" -ge 3 ]; then
+                  echo "::error::Failed batch $(basename "$file")"
                   return 1
                 fi
-                echo "Retry $attempt/3: $(basename "$file")"
-                sleep $((attempt * 2))
-                attempt=$((attempt + 1))
+                echo "Retry $attempt/2"
+                sleep $((attempt*2))
+                attempt=$((attempt+1))
               done
-
-              # Count only completed batches; never print Wrangler's noisy JSON.
-              flock "$PROGRESS_LOCK" bash -c '
-                echo x >> "$DONE_FILE"
-                done=$(wc -l < "$DONE_FILE")
-                echo "Progress: $done/$TOTAL_BATCHES batches completed"
-              '
+              records=$(grep -c '^INSERT OR REPLACE INTO movies' "$file" || true)
+              flock "$LOCK" bash -c '
+                echo "$1" >> "$DONE"
+                done_records=$(awk "{s+=\\$1} END {print s+0}" "$DONE")
+                done_batches=$(wc -l < "$DONE")
+                remaining=$((TOTAL-done_records))
+                [ "$remaining" -lt 0 ] && remaining=0
+                echo "PROGRESS: $done_records/$TOTAL records submitted; $remaining remaining; $done_batches/$BATCHES batches complete"
+              ' _ "$records"
             done
           }
 
           export -f run_lane
-          find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name 'lane-*' \
-            -print0 | xargs -0 -r -n1 -P4 bash -c 'run_lane "$1"' _
+          find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name 'lane-*' -print0 |
+            xargs -0 -r -n1 -P4 bash -c 'run_lane "$1"' _
 
-          echo "All batches completed."
+      - name: Verify database
+        shell: bash
+        env:
+          TOTAL: ${{ steps.catalog.outputs.total }}
+        run: |
+          set -euo pipefail
+          echo "SOURCE TOTAL: $TOTAL"
           npx --yes wrangler@4 d1 execute ctgmovies --remote \
-            --command="SELECT COUNT(*) AS total_records FROM movies;"
+            --command="SELECT COUNT(*) AS imported_unique_records FROM movies;"
